@@ -1886,7 +1886,7 @@ get_acme_cert() {
     local acme_log="/tmp/acme_output.log"
     
     # 直接执行 acme.sh，不使用 timeout（避免某些系统兼容性问题）
-    if "$acme_sh" --issue -d "$domain" --standalone --httpport 80 --force 2>&1 | tee "$acme_log" | grep -E "^\[|Verify finished|Cert success|error|Error" | sed 's/^/  /'; then
+    if "$acme_sh" --issue -d "$domain" --standalone --httpport 80 --force --server letsencrypt 2>&1 | tee "$acme_log" | grep -E "^\[|Verify finished|Cert success|error|Error" | sed 's/^/  /'; then
         echo ""
         _ok "证书申请成功，安装证书..."
         

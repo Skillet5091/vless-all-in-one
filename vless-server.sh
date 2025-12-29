@@ -1739,7 +1739,7 @@ diagnose_certificate() {
 
 # 创建伪装网页
 create_fake_website() {
-    local domain="$1"
+    local domain="${1:-$(get_ipv4)}"
     local protocol="$2"
     local custom_nginx_port="$3"  # 自定义 Nginx 订阅端口
     local protocol_port="${4:-443}"  # 新增：协议监听端口，默认 443
@@ -1750,78 +1750,154 @@ create_fake_website() {
     local nginx_conf_file=""
     if [[ -d "/etc/nginx/sites-available" ]]; then
         nginx_conf_dir="/etc/nginx/sites-available"
-        nginx_conf_file="$nginx_conf_dir/vless-fake"
+        nginx_conf_file="$nginx_conf_dir/vless-$domain.conf"
     elif [[ -d "/etc/nginx/conf.d" ]]; then
         nginx_conf_dir="/etc/nginx/conf.d"
-        nginx_conf_file="$nginx_conf_dir/vless-fake.conf"
+        nginx_conf_file="$nginx_conf_dir/vless-$domain.conf"
     elif [[ -d "/etc/nginx/http.d" ]]; then
         # Alpine
         nginx_conf_dir="/etc/nginx/http.d"
-        nginx_conf_file="$nginx_conf_dir/vless-fake.conf"
+        nginx_conf_file="$nginx_conf_dir/vless-$domain.conf"
     else
         nginx_conf_dir="/etc/nginx/conf.d"
-        nginx_conf_file="$nginx_conf_dir/vless-fake.conf"
+        nginx_conf_file="$nginx_conf_dir/vless-$domain.conf"
         mkdir -p "$nginx_conf_dir"
     fi
     
     # --- 深度清理上一次可能失败的配置或冲突配置 ---
-    _info "清理旧有 Nginx 伪装网配置..."
-    # 删除本脚本生成的所有可能配置文件
-    rm -f "$nginx_conf_dir/vless-fake"* 2>/dev/null
-    rm -f "/etc/nginx/conf.d/vless-fake"* 2>/dev/null
-    rm -f "/etc/nginx/sites-enabled/vless-fake" 2>/dev/null
-    rm -f "/etc/nginx/sites-enabled/default" 2>/dev/null # 强力清除默认配置
-    rm -f "/etc/nginx/conf.d/vless-sub.conf" 2>/dev/null
+    # 如果 protocol 是 content-only 或 refresh-only，不触动 Nginx 配置
+    if [[ "$protocol" != "content-only" && "$protocol" != "refresh-only" ]]; then
+        _info "清理旧有 Nginx 伪装配置 ($domain)..."
+        rm -f "$nginx_conf_file" 2>/dev/null
+        # 清除可能导致干扰的旧 catch-all 配置
+        rm -f "/etc/nginx/sites-enabled/vless-fake" 2>/dev/null
+        rm -f "/etc/nginx/sites-available/vless-fake" 2>/dev/null
+        rm -f "/etc/nginx/conf.d/vless-fake.conf" 2>/dev/null
+        rm -f "/etc/nginx/conf.d/vless-sub.conf" 2>/dev/null
+
+        # 如果是 sites-available 模式，也要处理 enabled 链接
+        if [[ "$nginx_conf_dir" == "/etc/nginx/sites-available" ]]; then
+            rm -f "/etc/nginx/sites-enabled/$(basename "$nginx_conf_file")" 2>/dev/null
+        fi
+    fi
 
     # 检测用户选择的协议端口冲突
-    _info "检测 $protocol_port 端口冲突源..."
-    local conflicts=()
-    # 扫描所有子配置和主配置文件
-    # 使用精确匹配: listen 后面直接跟端口，或端口后跟空格/分号
-    # 正则: listen[ \t:]+端口($|[ \t;]) 避免 443 匹配到 8443
-    for conf_file in $(grep -rE "listen[[:space:]:]+$protocol_port([[:space:];]|$)" /etc/nginx/conf.d/ /etc/nginx/sites-enabled/ /etc/nginx/http.d/ /etc/nginx/nginx.conf 2>/dev/null | cut -d: -f1 | sort -u); do
-        if [[ -f "$conf_file" && "$conf_file" != "$nginx_conf_file" ]]; then
-            conflicts+=("$conf_file")
-        fi
-    done
-
-    if [[ ${#conflicts[@]} -gt 0 ]]; then
-        _err "检测到 Nginx 配置中存在 $protocol_port 端口冲突！"
-        _item "原因" "协议需占用 $protocol_port 端口，以下文件正在干扰监听:"
-        for f in "${conflicts[@]}"; do
-            echo -e "      ${YELLOW}- $f${PLAIN}"
+    if [[ -n "$protocol_port" && "$protocol" != "content-only" && "$protocol" != "refresh-only" && "$protocol" != "config-only" ]]; then
+        _info "检测 $protocol_port 端口冲突源..."
+        local conflicts=()
+        # 扫描所有子配置和主配置文件
+        # 使用精确匹配: listen 后面直接跟端口，或端口后跟空格/分号
+        # 正则: listen[ \t:]+端口($|[ \t;]) 避免 443 匹配到 8443
+        for conf_file in $(grep -rE "listen[[:space:]:]+$protocol_port([[:space:];]|$)" /etc/nginx/conf.d/ /etc/nginx/sites-enabled/ /etc/nginx/http.d/ /etc/nginx/nginx.conf 2>/dev/null | cut -d: -f1 | sort -u); do
+            if [[ -f "$conf_file" && "$conf_file" != "$nginx_conf_file" ]]; then
+                conflicts+=("$conf_file")
+            fi
         done
-        echo ""
-        _item "手动解决建议" "请根据需要执行以下操作之一，然后重新运行脚本:"
-        echo -e "      1. ${CYAN}修改端口${PLAIN}: 将上述文件中的 $protocol_port 修改为其他端口 (如 8443)"
-        echo -e "      2. ${CYAN}暂时禁用${PLAIN}: mv 文件名 文件名.bak"
-        echo -e "      3. ${CYAN}快捷命令${PLAIN}: sed -i '/listen.*$protocol_port/s/^/#/' /etc/nginx/nginx.conf"
-        echo ""
-        exit 1
+
+        if [[ ${#conflicts[@]} -gt 0 ]]; then
+            _err "检测到 Nginx 配置中存在 $protocol_port 端口冲突！"
+            _item "原因" "协议需占用 $protocol_port 端口，以下文件正在干扰监听:"
+            for f in "${conflicts[@]}"; do
+                echo -e "      ${YELLOW}- $f${PLAIN}"
+            done
+            echo ""
+            _item "手动解决建议" "请根据需要执行以下操作之一，然后重新运行脚本:"
+            echo -e "      1. ${CYAN}修改端口${PLAIN}: 将上述文件中的 $protocol_port 修改为其他端口 (如 8443)"
+            echo -e "      2. ${CYAN}暂时禁用${PLAIN}: mv 文件名 文件名.bak"
+            echo -e "      3. ${CYAN}快捷命令${PLAIN}: sed -i '/listen.*$protocol_port/s/^/#/' /etc/nginx/nginx.conf"
+            echo ""
+            read -rp "  是否忽略冲突强制继续? (y/n, 默认 n): " force_continue
+            [[ ! "$force_continue" =~ ^[Yy]$ ]] && exit 1
+        fi
     fi
     # ----------------------------------------
     
     # 创建网页目录
     mkdir -p "$web_dir"
     
-    # 尝试下载高级伪装网页模板 (来源: 本项目仓库)
-    _info "正在获取高级伪装网页模板..."
-    local random_num=$(( RANDOM % 10 + 1 ))
-    local template_url="https://raw.githubusercontent.com/Skillet5091/vless-all-in-one/main/html/html${random_num}.zip"
-    
+    # 读取已有配置或使用随机模板
+    local mask_type="default"
+    local mask_value=""
+    if [[ -f "$CFG/mask.info" ]]; then
+        source "$CFG/mask.info"
+    fi
+
     local download_success=false
-    if command -v unzip >/dev/null 2>&1; then
-        if wget -q -O "$web_dir/template.zip" "$template_url"; then
-            unzip -o "$web_dir/template.zip" -d "$web_dir" >/dev/null 2>&1
-            rm -f "$web_dir/template.zip"
+    
+    # 如果 protocol 是 config-only，跳过模板下载和内容刷新
+    if [[ "$protocol" == "config-only" ]]; then
+        _info "正在更新 Nginx 配置 ($domain)..."
+        download_success=true
+    elif [[ "$mask_type" == "proxy" ]]; then
+        _info "当前配置为反向代理模式: $mask_value"
+        # 反代模式下只需保留一个极简 index.html 以防万一，核心逻辑在 Nginx proxy_pass
+        echo "Redirecting..." > "$web_dir/index.html"
+        download_success=true
+    elif [[ "$mask_type" == "custom" ]]; then
+        if [[ -d "$mask_value" ]]; then
+            _info "应用自定义伪装目录: $mask_value"
+            # 如果不是默认目录，则修改 web_dir
+            if [[ "$mask_value" != "$web_dir" ]]; then
+                web_dir="$mask_value"
+            fi
             download_success=true
-            _ok "高级模板下载并应用成功 (Template #$random_num)"
+        else
+            _warn "自定义目录 $mask_value 不存在，回退到默认模板"
+            mask_type="default"
+        fi
+    fi
+
+    if [[ "$mask_type" == "default" && "$protocol" != "config-only" ]]; then
+        # 尝试下载高级伪装网页模板
+        _info "正在从 GitHub 获取高级伪装网页模板..."
+        local random_num=$(( RANDOM % 10 + 1 ))
+        local template_url="https://raw.githubusercontent.com/Skillet5091/vless-all-in-one/main/html/html${random_num}.zip"
+        
+        if command -v unzip >/dev/null 2>&1; then
+            if wget -q --timeout=10 --tries=2 -O "$web_dir/template.zip" "$template_url"; then
+                # 清理旧文件
+                find "$web_dir" -mindepth 1 -maxdepth 1 ! -name 'template.zip' -exec rm -rf {} +
+                unzip -o "$web_dir/template.zip" -d "$web_dir" >/dev/null 2>&1
+                rm -f "$web_dir/template.zip"
+                
+                # 检查解压是否产生了子目录
+                if [[ ! -f "$web_dir/index.html" ]]; then
+                    local sub_dir=$(find "$web_dir" -maxdepth 1 -type d ! -path "$web_dir" | head -n 1)
+                    if [[ -n "$sub_dir" && -f "$sub_dir/index.html" ]]; then
+                        mv "$sub_dir"/* "$web_dir/" 2>/dev/null
+                        rm -rf "$sub_dir"
+                    fi
+                fi
+                
+                if [[ -f "$web_dir/index.html" ]]; then
+                    download_success=true
+                    _ok "高级模板下载并应用成功 (Template #$random_num)"
+                fi
+            else
+                _warn "Wget 下载失败，尝试使用 Curl..."
+                if curl -sL --connect-timeout 10 --retry 2 -o "$web_dir/template.zip" "$template_url"; then
+                    find "$web_dir" -mindepth 1 -maxdepth 1 ! -name 'template.zip' -exec rm -rf {} +
+                    unzip -o "$web_dir/template.zip" -d "$web_dir" >/dev/null 2>&1
+                    rm -f "$web_dir/template.zip"
+                    # 同样的子目录检查
+                    if [[ ! -f "$web_dir/index.html" ]]; then
+                        local sub_dir=$(find "$web_dir" -maxdepth 1 -type d ! -path "$web_dir" | head -n 1)
+                        if [[ -n "$sub_dir" && -f "$sub_dir/index.html" ]]; then
+                            mv "$sub_dir"/* "$web_dir/" 2>/dev/null
+                            rm -rf "$sub_dir"
+                        fi
+                    fi
+                    if [[ -f "$web_dir/index.html" ]]; then
+                        download_success=true
+                        _ok "高级模板下载并应用成功 (via Curl, Template #$random_num)"
+                    fi
+                fi
+            fi
         fi
     fi
 
     if [[ "$download_success" == "false" ]]; then
-        [[ "$download_success" == "false" ]] && _warn "高级模板应用失败，回退至基础网页"
-        # 创建基础伪装网页
+        _warn "无法应用高级伪装，使用内置静态页面"
         cat > "$web_dir/index.html" << 'EOF'
 <!DOCTYPE html>
 <html lang="en">
@@ -1830,29 +1906,28 @@ create_fake_website() {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Welcome</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
-        .container { max-width: 800px; margin: 0 auto; background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1 { color: #333; text-align: center; }
-        p { color: #666; line-height: 1.6; }
-        .footer { text-align: center; margin-top: 40px; color: #999; font-size: 14px; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 0; padding: 20px; background: #fafafa; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+        .container { max-width: 600px; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); text-align: center; }
+        h1 { color: #1a1a1a; font-size: 24px; margin-bottom: 16px; }
+        p { color: #666; line-height: 1.6; font-size: 16px; margin-bottom: 24px; }
+        .footer { border-top: 1px solid #eee; padding-top: 20px; color: #999; font-size: 14px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Welcome to Our Website</h1>
-        <p>This is a secure gateway. We provide high-quality network services and solutions.</p>
-        <p>Our infrastructure is optimized for performance and reliability. If you have any questions, please contact the administrator.</p>
+        <h1>Server Is Ready</h1>
+        <p>Your web application environment has been successfully configured and is now active.</p>
+        <p>This is a default landing page. Please replace it with your own content in the masquerade settings.</p>
         <div class="footer">
-            <p>&copy; 2024-2025 Secure Services. All rights reserved.</p>
+            <p>&copy; 2025 Web Services. All rights reserved.</p>
         </div>
     </div>
 </body>
 </html>
 EOF
     fi
-    
-    # 检查是否有SSL证书，决定使用Nginx
-    if [[ -n "$domain" ]] && [[ -f "/etc/vless-reality/certs/server.crt" ]]; then
+    # 检查是否有SSL证书，决定使用Nginx (content-only/refresh-only 模式不配置 Nginx)
+    if [[ -n "$domain" && "$protocol" != "content-only" && "$protocol" != "refresh-only" ]] && [[ -f "/etc/vless-reality/certs/server.crt" ]]; then
         # 安装Nginx（如果未安装）
         if ! command -v nginx >/dev/null 2>&1; then
             _info "安装Nginx..."
@@ -1878,138 +1953,138 @@ EOF
         if [[ "$protocol" == "vless" || "$protocol" == "vless-xhttp" ]]; then
             # Reality协议：Nginx独立运行，提供HTTP订阅服务
             nginx_port="${custom_nginx_port:-8080}"
-            nginx_listen="0.0.0.0:$nginx_port"
+            nginx_listen="$nginx_port"
             nginx_comment="独立提供订阅服务 (HTTP)，不与Reality冲突"
         elif [[ "$protocol" == "vless-vision" || "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan" ]]; then
-            # 证书协议：Nginx 同时监听指定的 fallback 端口和自定义订阅端口
-            # 使用用户指定的端口，或默认 2053 (Cloudflare 支持)
-            nginx_port="${custom_nginx_port:-2053}"
-            nginx_listen="127.0.0.1:$fb_port"  # fallback 后端
-            nginx_comment="${fb_port}端口作为fallback，${nginx_port}端口提供HTTPS订阅"
+            # 证书协议：Nginx 监听回落端口
+            nginx_port="80" 
+            nginx_listen="$fb_port"  # fallback 后端
+            nginx_comment="${fb_port}端口作为fallback"
             nginx_ssl="ssl"
         fi
         
-        # 配置Nginx
-        if [[ "$protocol" == "vless-vision" || "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan" ]]; then
-            # 证书协议：双端口配置
-            cat > "$nginx_conf_file" << EOF
+    # 配置Nginx (仅配置回落后端)
+    if [[ "$protocol" == "vless-vision" || "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan" ]]; then
+cat > "$nginx_conf_file" << EOF
 # Fallback 后端 (供 Xray 回落使用)
 server {
-    listen 127.0.0.1:$fb_port;
+    listen $fb_port;
     server_name $domain;
     
-    root $web_dir;
-    index index.html;
-    
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
+    $(if [[ -f "$CFG/mask.info" ]]; then
+        source "$CFG/mask.info"
+        if [[ "$mask_type" == "proxy" ]]; then
+            echo "    location / {"
+            echo "        proxy_pass $mask_value;"
+            echo "        proxy_set_header Host \$host;"
+            echo "        proxy_set_header X-Real-IP \$remote_addr;"
+            echo "        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
+            echo "        proxy_ssl_server_name on;"
+            echo "    }"
+        else
+            echo "    root $web_dir;"
+            echo "    index index.html;"
+            echo "    location / {"
+            echo "        try_files \$uri \$uri/ =404;"
+            echo "    }"
+        fi
+    else
+        echo "    root $web_dir;"
+        echo "    index index.html;"
+        echo "    location / {"
+        echo "        try_files \$uri \$uri/ =404;"
+        echo "    }"
+    fi)
     
     server_tokens off;
-}
 
-# HTTPS 订阅服务 (独立端口)
-server {
-    listen 0.0.0.0:$nginx_port ssl http2;
-    server_name $domain;
-    
-    ssl_certificate /etc/vless-reality/certs/server.crt;
-    ssl_certificate_key /etc/vless-reality/certs/server.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    
-    root $web_dir;
-    index index.html;
-    
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-    
-    # 订阅文件目录 - v2ray 映射到 base64
-    # 路径格式: /sub/salt/uuid/v2ray
-    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/v2ray\$ {
-        alias $CFG/subscription/\$1/base64;
+    $(if [[ -f "$CFG/sub.info" ]]; then
+        cat << 'SUBEOF'
+    # 订阅文件目录 (UUID 匹配由 salt/uuid 组成)
+    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/v2ray$ {
+        alias /etc/vless-reality/subscription/$1/base64;
         default_type text/plain;
         add_header Content-Type "text/plain; charset=utf-8";
     }
-    
-    # 订阅文件目录 - clash
-    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/clash\$ {
-        alias $CFG/subscription/\$1/clash.yaml;
+
+    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/clash$ {
+        alias /etc/vless-reality/subscription/$1/clash.yaml;
         default_type text/yaml;
     }
-    
-    # 订阅文件目录 - surge
-    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/surge\$ {
-        alias $CFG/subscription/\$1/surge.conf;
+
+    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/surge$ {
+        alias /etc/vless-reality/subscription/$1/surge.conf;
         default_type text/plain;
     }
-    
-    # 订阅文件目录 - singbox
-    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/singbox\$ {
-        alias $CFG/subscription/\$1/singbox.json;
+
+    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/singbox$ {
+        alias /etc/vless-reality/subscription/$1/singbox.json;
         default_type application/json;
     }
-    
-    # 订阅文件目录 - 通用
-    location /sub/ {
-        alias $CFG/subscription/;
-        autoindex off;
-        default_type text/plain;
-    }
-    
-    server_tokens off;
+SUBEOF
+    fi)
 }
 EOF
         else
             # Reality协议：单端口配置
-            cat > "$nginx_conf_file" << EOF
+cat > "$nginx_conf_file" << EOF
 server {
     listen $nginx_listen;  # $nginx_comment
     server_name $domain;
     
-    root $web_dir;
-    index index.html;
-    
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-    
-    # 订阅文件目录 - v2ray 映射到 base64
-    # 路径格式: /sub/salt/uuid/v2ray
-    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/v2ray\$ {
-        alias $CFG/subscription/\$1/base64;
-        default_type text/plain;
-        add_header Content-Type "text/plain; charset=utf-8";
-    }
-    
-    # 订阅文件目录 - clash
-    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/clash\$ {
-        alias $CFG/subscription/\$1/clash.yaml;
-        default_type text/yaml;
-    }
-    
-    # 订阅文件目录 - surge
-    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/surge\$ {
-        alias $CFG/subscription/\$1/surge.conf;
-        default_type text/plain;
-    }
-    
-    # 订阅文件目录 - singbox
-    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/singbox\$ {
-        alias $CFG/subscription/\$1/singbox.json;
-        default_type application/json;
-    }
-    
-    # 订阅文件目录 - 通用
-    location /sub/ {
-        alias $CFG/subscription/;
-        autoindex off;
-        default_type text/plain;
-    }
+    $(if [[ -f "$CFG/mask.info" ]]; then
+        source "$CFG/mask.info"
+        if [[ "$mask_type" == "proxy" ]]; then
+            echo "    location / {"
+            echo "        proxy_pass $mask_value;"
+            echo "        proxy_set_header Host \$host;"
+            echo "        proxy_set_header X-Real-IP \$remote_addr;"
+            echo "        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
+            echo "        proxy_ssl_server_name on;"
+            echo "    }"
+        else
+            echo "    root $web_dir;"
+            echo "    index index.html;"
+            echo "    location / {"
+            echo "        try_files \$uri \$uri/ =404;"
+            echo "    }"
+        fi
+    else
+        echo "    root $web_dir;"
+        echo "    index index.html;"
+        echo "    location / {"
+        echo "        try_files \$uri \$uri/ =404;"
+        echo "    }"
+    fi)
     
     # 隐藏Nginx版本
     server_tokens off;
+
+    $(if [[ -f "$CFG/sub.info" ]]; then
+        cat << 'SUBEOF'
+    # 订阅文件目录 (UUID 匹配由 salt/uuid 组成)
+    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/v2ray$ {
+        alias /etc/vless-reality/subscription/$1/base64;
+        default_type text/plain;
+        add_header Content-Type "text/plain; charset=utf-8";
+    }
+
+    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/clash$ {
+        alias /etc/vless-reality/subscription/$1/clash.yaml;
+        default_type text/yaml;
+    }
+
+    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/surge$ {
+        alias /etc/vless-reality/subscription/$1/surge.conf;
+        default_type text/plain;
+    }
+
+    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/singbox$ {
+        alias /etc/vless-reality/subscription/$1/singbox.json;
+        default_type application/json;
+    }
+SUBEOF
+    fi)
 }
 EOF
         fi
@@ -2017,24 +2092,31 @@ EOF
         # 如果使用 sites-available 模式，创建软链接
         if [[ "$nginx_conf_dir" == "/etc/nginx/sites-available" ]]; then
             mkdir -p /etc/nginx/sites-enabled
-            rm -f /etc/nginx/sites-enabled/default
-            ln -sf "$nginx_conf_file" /etc/nginx/sites-enabled/vless-fake
+            ln -sf "$nginx_conf_file" "/etc/nginx/sites-enabled/$(basename "$nginx_conf_file")"
         fi
+        
+        # --- 移除分流回收站 (Scavenger) ---
+        # 按照用户要求，不再进行强制跳转，而是由用户手动在其它子域名配置中增加明文监听实现原生交接
+        local scavenger_conf="/etc/nginx/conf.d/vless-scavenger.conf"
+        rm -f "$scavenger_conf" 2>/dev/null
         
         # 测试Nginx配置
         _info "配置Nginx并启动Web服务..."
         if nginx -t 2>/dev/null; then
-            # 强制重启 Nginx 确保新配置生效（直接用 systemctl，更可靠）
+            # 使用安全重载，避免服务中断
             if [[ "$DISTRO" == "alpine" ]]; then
-                rc-service nginx stop 2>/dev/null
-                sleep 1
-                rc-service nginx start 2>/dev/null
+                rc-service nginx reload 2>/dev/null || nginx -s reload 2>/dev/null
             else
-                systemctl stop nginx 2>/dev/null
-                sleep 1
-                systemctl start nginx 2>/dev/null
+                systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null
             fi
             sleep 1
+            
+            # 记录成功配置信息并提供共存建议
+            if [[ "$protocol" != "config-only" ]]; then
+                _ok "伪装网页已创建"
+                _info "注意: 若要让其它子域名 (如 Emby) 在 443 端口正常工作，"
+                _info "请在其 Nginx 配置文件的 'listen $fb_port ssl;' 之前增加一行: listen $fb_port;"
+            fi
             
             # 验证端口是否监听（兼容不同系统）
             local port_listening=false
@@ -2053,12 +2135,12 @@ EOF
             fi
             
             if [[ "$nginx_running" == "true" && "$port_listening" == "true" ]]; then
-                _ok "伪装网页已创建并启动"
                 _ok "Web服务器运行正常，订阅链接可用"
                 if [[ "$protocol" == "vless" || "$protocol" == "vless-xhttp" ]]; then
                     _ok "伪装网页: http://$domain:$nginx_port"
                 elif [[ "$protocol" == "vless-vision" || "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan" ]]; then
-                    _ok "伪装网页: https://$domain:$nginx_port"
+                    _ok "伪装网页: https://$domain:$fb_port"
+                    _warn "注意: 443 端口由 Xray 监听，Nginx 监听回落端口 $fb_port。"
                 fi
                 echo -e "  ${D}提示: 自定义伪装网页请将 HTML 文件放入 $web_dir${NC}"
             elif [[ "$nginx_running" == "true" ]]; then
@@ -2078,11 +2160,16 @@ EOF
         # 保存订阅配置信息（关键！确保订阅链接显示正确）
         local sub_uuid=$(get_sub_uuid)
         local use_https="false"
-        [[ "$protocol" == "vless-vision" || "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan" ]] && use_https="true"
+        local sub_report_port="$nginx_port"
+        
+        if [[ "$protocol" == "vless-vision" || "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan" ]]; then
+            use_https="true"
+            sub_report_port="443" # 外部访问走 443
+        fi
         
         cat > "$CFG/sub.info" << EOF
 sub_uuid=$sub_uuid
-sub_port=$nginx_port
+sub_port=$sub_report_port
 sub_domain=$domain
 sub_https=$use_https
 EOF
@@ -9207,205 +9294,11 @@ setup_nginx_sub() {
     # 确保订阅文件存在
     generate_sub_files
     
-    local sub_dir="$CFG/subscription/$sub_path_id"
-    local fake_conf="/etc/nginx/conf.d/vless-fake.conf"
-    
-    # 检查 vless-fake.conf 是否已经配置了订阅端口
-    if [[ -f "$fake_conf" ]] && grep -q "listen.*$sub_port" "$fake_conf" 2>/dev/null; then
-        # 检查是否有正确的订阅路由配置 (使用 alias 而不是 try_files)
-        if grep -q "location.*sub.*alias.*subscription" "$fake_conf" 2>/dev/null; then
-            # 保存订阅配置
-            cat > "$CFG/sub.info" << EOF
-sub_uuid=$sub_uuid
-sub_port=$sub_port
-sub_domain=$domain
-sub_https=$use_https
-EOF
-            # 重载 Nginx 确保配置生效
-            nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null
-            _ok "订阅服务已配置 (复用现有 Nginx 配置)"
-            return 0
-        else
-            # 旧配置没有正确的订阅路由，需要重新生成
-            _warn "检测到旧版 Nginx 配置，正在更新订阅路由..."
-            rm -f "$fake_conf"
-            # 重新调用 create_fake_website 生成正确的配置
-            create_fake_website "$domain" "vless-vision" "$sub_port"
-        fi
-    fi
-    
-    # 检查证书
-    local cert_file="$CFG/certs/server.crt"
-    local key_file="$CFG/certs/server.key"
-    local nginx_conf="/etc/nginx/conf.d/vless-sub.conf"
-    
-    # 先删除可能存在的旧配置，避免冲突
-    rm -f "$nginx_conf" 2>/dev/null
-    
-    if [[ "$use_https" == "true" && ( ! -f "$cert_file" || ! -f "$key_file" ) ]]; then
-        _warn "证书不存在，生成自签名证书..."
-        gen_self_cert "${domain:-localhost}"
-    fi
-    
-    # 再次检查证书是否存在
-    if [[ "$use_https" == "true" && ( ! -f "$cert_file" || ! -f "$key_file" ) ]]; then
-        _err "证书文件不存在，无法配置 HTTPS"
-        _warn "切换到 HTTP 模式..."
-        use_https="false"
-    fi
-    
-    _info "配置 Nginx..."
-    
-    mkdir -p /etc/nginx/conf.d
-    
-    if [[ "$use_https" == "true" ]]; then
-        cat > "$nginx_conf" << EOF
-server {
-    listen $sub_port ssl http2;
-    listen [::]:$sub_port ssl http2;
-    server_name ${domain:-_};
-    
-    ssl_certificate $cert_file;
-    ssl_certificate_key $key_file;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    
-    # 订阅路径
-    location /sub/$sub_uuid/ {
-        alias $sub_dir/;
-        default_type text/plain;
-        add_header Content-Type 'text/plain; charset=utf-8';
-    }
-    
-    # Clash 订阅
-    location /sub/$sub_uuid/clash {
-        alias $sub_dir/clash.yaml;
-        default_type text/yaml;
-        add_header Content-Disposition 'attachment; filename="clash.yaml"';
-    }
-    
-    # Surge 订阅
-    location /sub/$sub_uuid/surge {
-        alias $sub_dir/surge.conf;
-        default_type text/plain;
-        add_header Content-Disposition 'attachment; filename="surge.conf"';
-    }
-    
-    # 通用订阅 (Base64)
-    location /sub/$sub_uuid/v2ray {
-        alias $sub_dir/base64;
-        default_type text/plain;
-    }
-    
-    # 伪装网页
-    root /var/www/html;
-    index index.html;
-    
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-    
-    # 隐藏 Nginx 版本
-    server_tokens off;
+    # 全部由 create_fake_website 处理，使用 config-only 模式避免重复下载网页
+    create_fake_website "$domain" "config-only" "$sub_port"
+    return 0
 }
-EOF
-    else
-        cat > "$nginx_conf" << EOF
-server {
-    listen $sub_port;
-    listen [::]:$sub_port;
-    server_name ${domain:-_};
-    
-    location /sub/$sub_uuid/ {
-        alias $sub_dir/;
-        default_type text/plain;
-        add_header Content-Type 'text/plain; charset=utf-8';
-    }
-    
-    location /sub/$sub_uuid/clash {
-        alias $sub_dir/clash.yaml;
-        default_type text/yaml;
-        add_header Content-Disposition 'attachment; filename="clash.yaml"';
-    }
-    
-    location /sub/$sub_uuid/surge {
-        alias $sub_dir/surge.conf;
-        default_type text/plain;
-        add_header Content-Disposition 'attachment; filename="surge.conf"';
-    }
-    
-    location /sub/$sub_uuid/v2ray {
-        alias $sub_dir/base64;
-        default_type text/plain;
-    }
-    
-    # 伪装网页
-    root /var/www/html;
-    index index.html;
-    
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-    
-    # 隐藏 Nginx 版本
-    server_tokens off;
-}
-EOF
-    fi
-    
-    # 确保伪装网页存在
-    if [[ ! -f "/var/www/html/index.html" ]]; then
-        mkdir -p /var/www/html
-        cat > /var/www/html/index.html << 'HTMLEOF'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Welcome</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
-        .container { max-width: 800px; margin: 0 auto; background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1 { color: #333; text-align: center; }
-        p { color: #666; line-height: 1.6; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Welcome to Our Website</h1>
-        <p>This is a simple website hosted on our server.</p>
-    </div>
-</body>
-</html>
-HTMLEOF
-    fi
-    
-    # 清理旧的订阅目录
-    find "$CFG/subscription" -mindepth 1 -maxdepth 1 -type d ! -name "$sub_uuid" -exec rm -rf {} \; 2>/dev/null
-    
-    # 保存订阅配置
-    cat > "$CFG/sub.info" << EOF
-sub_uuid=$sub_uuid
-sub_port=$sub_port
-sub_domain=$domain
-sub_https=$use_https
-EOF
-    
-    # 测试并重载 Nginx
-    if nginx -t 2>/dev/null; then
-        if [[ "$DISTRO" == "alpine" ]]; then
-            rc-service nginx restart 2>/dev/null || nginx -s reload
-        else
-            systemctl reload nginx 2>/dev/null || nginx -s reload
-        fi
-        _ok "Nginx 配置完成"
-        return 0
-    else
-        _err "Nginx 配置错误"
-        rm -f "$nginx_conf"
-        return 1
-    fi
-}
+
 
 # 显示订阅链接
 show_sub_links() {
@@ -9446,6 +9339,90 @@ show_sub_links() {
     fi
 }
 
+# 伪装站管理
+manage_masquerade() {
+    while true; do
+        _header
+        echo -e "  ${W}伪装站管理${NC}"
+        _line
+        
+        local mask_type="default"
+        local mask_value=""
+        [[ -f "$CFG/mask.info" ]] && source "$CFG/mask.info"
+        
+        local mode_text=""
+        case "$mask_type" in
+            default) mode_text="${G}随机模板 (GitHub)${NC}" ;;
+            custom)  mode_text="${G}本地目录${NC} ($mask_value)" ;;
+            proxy)   mode_text="${G}反向代理${NC} ($mask_value)" ;;
+        esac
+        
+        echo -e "  当前模式: $mode_text"
+        echo ""
+        _item "1" "使用随机高品质模板 (GitHub)"
+        _item "2" "使用自定义本地目录"
+        _item "3" "使用反向代理 (推荐，模拟真实站点)"
+        _item "4" "立即刷新当前伪装站内容"
+        _item "0" "返回"
+        _line
+        
+        read -rp "  请选择: " choice
+        
+        case $choice in
+            1)
+                cat > "$CFG/mask.info" << EOF
+mask_type="default"
+mask_value=""
+EOF
+                # 仅刷新内容文件，跳过 Nginx 配置和端口检测
+                create_fake_website "" "content-only" "" ""
+                _ok "已切换到随机模板模式"
+                ;;
+            2)
+                read -rp "  请输入本地目录绝对路径: " custom_dir
+                if [[ -d "$custom_dir" ]]; then
+                    cat > "$CFG/mask.info" << EOF
+mask_type="custom"
+mask_value="$custom_dir"
+EOF
+                    # 仅刷新内容，跳过 Nginx 配置和端口检测
+                    create_fake_website "" "content-only" "" ""
+                    _ok "已设置自定义目录"
+                else
+                    _err "目录不存在"
+                fi
+                ;;
+            3)
+                read -rp "  请输入反代目标 URL (如 https://www.bing.com): " proxy_url
+                if [[ "$proxy_url" =~ ^https?:// ]]; then
+                    cat > "$CFG/mask.info" << EOF
+mask_type="proxy"
+mask_value="$proxy_url"
+EOF
+                    # 仅刷新内容，跳过 Nginx 配置和端口检测
+                    create_fake_website "" "content-only" "" ""
+                    _ok "已设置反向代理"
+                else
+                    _err "无效的 URL 格式"
+                fi
+                ;;
+            4)
+                # 强制刷新内容
+                create_fake_website "" "refresh-only" "" ""
+                _ok "内容已刷新"
+                ;;
+            0) return ;;
+        esac
+        
+        # 只要有修改且已配置过订阅，就尝试更新 Nginx 配置以同步 Web 服务
+        if [[ $choice -ge 1 && $choice -le 3 && -f "$CFG/sub.info" ]]; then
+            source "$CFG/sub.info"
+            # setup_nginx_sub 会调用 create_fake_website 更新后端路由
+            setup_nginx_sub "$sub_port" "$sub_domain" "$sub_https"
+        fi
+        _pause
+    done
+}
 # 订阅服务管理菜单
 manage_subscription() {
     while true; do
@@ -9550,18 +9527,24 @@ setup_subscription_interactive() {
     fi
     
     # 端口（带冲突检测）
-    local default_port=8443
+    local fb_port="80"
+    [[ -f "$CFG/fallback_port" ]] && fb_port=$(cat "$CFG/fallback_port")
+    local default_port="$fb_port"
+    
+    # 如果 fallback_port 没设置或默认，且不是 Reality，建议使用 8443
+    if [[ "$default_port" == "80" ]]; then
+        default_port=8443
+    fi
     local sub_port=""
     
     while true; do
         read -rp "  订阅端口 [$default_port]: " sub_port
         sub_port="${sub_port:-$default_port}"
         
-        # 检查是否被已安装协议占用
-        local conflict_proto=$(is_internal_port_occupied "$sub_port")
-        if [[ -n "$conflict_proto" ]]; then
-            _err "端口 $sub_port 已被 [$conflict_proto] 协议占用"
-            _warn "请选择其他端口"
+        # 严禁直接使用 443 端口
+        if [[ "$sub_port" == "443" ]]; then
+            _err "端口 443 为 Xray 核心通讯端口，不能直接用于 Web 订阅服务！"
+            _warn "请选择回落端口 (如 $fb_port) 或自定义端口 (如 8443)"
             continue
         fi
         
@@ -9611,104 +9594,9 @@ setup_subscription_interactive() {
     rm -f /etc/nginx/conf.d/vless-fake.conf 2>/dev/null
     rm -f /etc/nginx/sites-enabled/vless-fake 2>/dev/null
     
-    if [[ "$use_https" == "true" ]]; then
-        # HTTPS 模式：需要证书
-        local cert_file="$CFG/certs/server.crt"
-        local key_file="$CFG/certs/server.key"
-        
-        # 检查证书是否存在，不存在则生成自签名证书
-        if [[ ! -f "$cert_file" || ! -f "$key_file" ]]; then
-            _info "生成自签名证书..."
-            mkdir -p "$CFG/certs"
-            openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-                -keyout "$key_file" -out "$cert_file" \
-                -subj "/CN=$server_name" 2>/dev/null
-        fi
-        
-        cat > "$nginx_conf" << EOF
-server {
-    listen $sub_port ssl http2;
-    listen [::]:$sub_port ssl http2;
-    server_name $server_name;
+    # 调用统一配置函数
+    setup_nginx_sub "$sub_port" "$sub_domain" "$use_https"
 
-    ssl_certificate $cert_file;
-    ssl_certificate_key $key_file;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-
-    root /var/www/html;
-    index index.html;
-
-    # 订阅路径 (路径格式: /sub/salt/uuid/format)
-    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/v2ray\$ {
-        alias $CFG/subscription/\$1/base64;
-        default_type text/plain;
-        add_header Content-Type "text/plain; charset=utf-8";
-    }
-
-    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/clash\$ {
-        alias $CFG/subscription/\$1/clash.yaml;
-        default_type text/yaml;
-    }
-
-    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/surge\$ {
-        alias $CFG/subscription/\$1/surge.conf;
-        default_type text/plain;
-    }
-
-    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/singbox\$ {
-        alias $CFG/subscription/\$1/singbox.json;
-        default_type application/json;
-    }
-
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-
-    server_tokens off;
-}
-EOF
-    else
-        # HTTP 模式
-        cat > "$nginx_conf" << EOF
-server {
-    listen $sub_port;
-    listen [::]:$sub_port;
-    server_name $server_name;
-
-    root /var/www/html;
-    index index.html;
-
-    # 订阅路径 (路径格式: /sub/salt/uuid/format)
-    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/v2ray\$ {
-        alias $CFG/subscription/\$1/base64;
-        default_type text/plain;
-        add_header Content-Type "text/plain; charset=utf-8";
-    }
-
-    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/clash\$ {
-        alias $CFG/subscription/\$1/clash.yaml;
-        default_type text/yaml;
-    }
-
-    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/surge\$ {
-        alias $CFG/subscription/\$1/surge.conf;
-        default_type text/plain;
-    }
-
-    location ~ ^/sub/([a-z0-9]+/[a-f0-9-]+)/singbox\$ {
-        alias $CFG/subscription/\$1/singbox.json;
-        default_type application/json;
-    }
-
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-
-    server_tokens off;
-}
-EOF
-    fi
     
     # 确保伪装网页存在
     mkdir -p /var/www/html
@@ -10087,8 +9975,9 @@ main_menu() {
             _item "1" "安装新协议 (多协议共存)"
             _item "2" "查看所有协议配置"
             _item "3" "订阅服务管理"
-            _item "4" "管理协议服务"
-            _item "5" "BBR 网络优化"
+            _item "4" "伪装站管理"
+            _item "5" "管理协议服务"
+            _item "6" "BBR 网络优化"
             _item "6" "卸载指定协议"
             _item "7" "完全卸载"
             _item "8" "查看运行日志"
@@ -10106,8 +9995,9 @@ main_menu() {
                 1) do_install_server ;;
                 2) show_all_protocols_info ;;
                 3) manage_subscription ;;
-                4) manage_protocol_services ;;
-                5) manage_advanced_settings ;;
+                4) manage_masquerade ;;
+                5) manage_protocol_services ;;
+                6) manage_advanced_settings ;;
                 6) uninstall_specific_protocol ;;
                 7) do_uninstall ;;
                 8) show_logs ;;

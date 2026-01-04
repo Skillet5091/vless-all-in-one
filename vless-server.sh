@@ -12386,6 +12386,7 @@ gen_clash_sub() {
     local ipv4=$(get_ipv4)
     local ipv6=$(get_ipv6)
     local proxies=""
+    local all_proxy_names=""
     
     # 存储分组信息 (需要 Bash 4.0+)
     declare -A country_proxies
@@ -13380,24 +13381,16 @@ show_sub_links() {
     local protocol="http"
     [[ "$sub_https" == "true" ]] && protocol="https"
     
-    # 计算基础 URL
+    # 计算基础 URL (显式保留所有端口)
     local port_suffix=":${sub_port}"
-    [[ "$sub_port" == "8443" || "$sub_port" == "443" || "$sub_port" == "80" ]] && port_suffix=""
-    
     local base_url="${protocol}://${sub_domain:-$ipv4}${port_suffix}/sub/${sub_uuid}"
     
     _header
     echo -e "  ${W}订阅服务地址${NC}"
     _line
     
-    # 场景 1: 如果是 8443 或 443，直接显示
-    if [[ "$sub_port" == "8443" || "$sub_port" == "443" ]]; then
-        echo -e "  ${C}模式: [443 回落/CDN 模式] (推荐)${NC}"
-        echo -e "  ${Y}URL:${NC} ${G}${protocol}://${sub_domain:-$ipv4}/sub/${sub_uuid}/...${NC}"
-    else
-        echo -e "  ${C}模式: [独立端口模式]${NC}"
-        echo -e "  ${Y}URL:${NC} ${G}${base_url}/...${NC}"
-    fi
+    echo -e "  ${C}当前订阅端口: ${sub_port}${NC}"
+    echo -e "  ${Y}根 URL:${NC} ${G}${protocol}://${sub_domain:-$ipv4}:${sub_port}/sub/${sub_uuid}/...${NC}"
     
     echo ""
     echo -e "  ${Y}Clash/V2Ray/Sing-box 通用入口:${NC}"
@@ -13431,15 +13424,16 @@ manage_subscription() {
             echo -e "  HTTPS: ${G}$sub_https${NC}"
             echo ""
             _item "1" "查看订阅链接"
-            _item "2" "更新订阅内容 (生成新节点)"
+            _item "2" "更新订阅内容 (同步节点到 Clash/Sing-box)"
             _item "3" "外部节点管理"
-            _item "4" "回落端口管理 (当前: $(cat "$CFG/fallback_port" 2>/dev/null || echo "8443"))"
-            _item "5" "初始化/重排 Nginx 伪装配置"
-            _item "6" "停用订阅服务"
+            _item "4" "修改订阅端口 (当前: ${G}${sub_port}${NC})"
+            _item "5" "回落端口管理 (当前: $(cat "$CFG/fallback_port" 2>/dev/null || echo "8443"))"
+            _item "6" "手动刷新 Nginx 配置"
+            _item "7" "停用订阅服务"
         else
             echo -e "  状态: ${D}未配置${NC}"
             echo ""
-            _item "1" "启用订阅服务 (智能配置 Nginx)"
+            _item "1" "初始化订阅服务 (配置 Nginx)"
             _item "2" "外部节点管理"
         fi
         _item "0" "返回"
@@ -13452,15 +13446,32 @@ manage_subscription() {
                 1) show_sub_links; _pause ;;
                 2) 
                     generate_sub_files
-                    if setup_nginx_sub "$sub_port" "$sub_domain" "$sub_https"; then
-                        _ok "订阅内容与 Nginx 配置已同步更新"
-                    fi
+                    _ok "本地订阅文件已刷新"
                     _pause 
                     ;;
                 3) manage_external_nodes ;;
-                4) manage_fb_port ;;
-                5) create_fake_website "config-only" "config-only"; _pause ;;
-                6) 
+                4) 
+                    read -rp "  请输入新端口: " new_sub_port
+                    if [[ "$new_sub_port" =~ ^[0-9]+$ ]]; then
+                        if setup_nginx_sub "$new_sub_port" "$sub_domain" "$sub_https"; then
+                            sub_port="$new_sub_port"
+                            # 更新 sub.info
+                            cat > "$CFG/sub.info" << EOF
+sub_uuid=$sub_uuid
+sub_port=$sub_port
+sub_domain=$sub_domain
+sub_https=$sub_https
+EOF
+                            _ok "订阅端口已更新为: $sub_port"
+                        fi
+                    else
+                        _err "无效端口"
+                    fi
+                    _pause
+                    ;;
+                5) manage_fb_port ;;
+                6) create_fake_website "config-only" "config-only"; _pause ;;
+                7) 
                     # 彻底清理所有可能的 Nginx 配置路径
                     if [[ -f "$CFG/sub.info" ]]; then
                         local s_uuid="" s_port="" s_domain="" s_https=""

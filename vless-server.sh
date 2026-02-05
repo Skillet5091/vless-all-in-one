@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.1.3 [服务端]
+#  多协议代理一键部署脚本 v3.4.7 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -149,8 +149,1094 @@ db_get_all_protocols() {
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
+#  多IP入出站配置 (IP Routing)
+#═══════════════════════════════════════════════════════════════════════════════
+
+# 获取系统所有公网IPv4地址
+get_all_public_ipv4() {
+    ip -4 addr show scope global 2>/dev/null | awk '/inet / {print $2}' | cut -d'/' -f1 | sort -u
+}
+
+# 获取系统所有公网IPv6地址
+get_all_public_ipv6() {
+    ip -6 addr show scope global 2>/dev/null | awk '/inet6/ {print $2}' | cut -d'/' -f1 | grep -v '^fe80' | sort -u
+}
+
+# 获取系统所有公网IP (IPv4 + IPv6)
+get_all_public_ips() {
+    {
+        get_all_public_ipv4
+        get_all_public_ipv6
+    } | sort -u
+}
+
+# 获取IP路由配置
+db_get_ip_routing() {
+    [[ ! -f "$DB_FILE" ]] && return 1
+    jq -r '.ip_routing // empty' "$DB_FILE" 2>/dev/null
+}
+
+# 获取IP路由规则列表
+db_get_ip_routing_rules() {
+    [[ ! -f "$DB_FILE" ]] && return 1
+    jq -r '.ip_routing.rules // []' "$DB_FILE" 2>/dev/null
+}
+
+# 检查IP路由是否启用
+db_ip_routing_enabled() {
+    [[ ! -f "$DB_FILE" ]] && return 1
+    local enabled=$(jq -r '.ip_routing.enabled // false' "$DB_FILE" 2>/dev/null)
+    [[ "$enabled" == "true" ]]
+}
+
+# 添加IP路由规则
+# 用法: db_add_ip_routing_rule "入站IP" "出站IP"
+db_add_ip_routing_rule() {
+    local inbound_ip="$1"
+    local outbound_ip="$2"
+    [[ -z "$inbound_ip" || -z "$outbound_ip" ]] && return 1
+    [[ ! -f "$DB_FILE" ]] && init_db
+    
+    local tmp=$(mktemp)
+    jq --arg in_ip "$inbound_ip" --arg out_ip "$outbound_ip" '
+        .ip_routing.enabled = true |
+        .ip_routing.rules = ((.ip_routing.rules // []) | 
+            [.[] | select(.inbound_ip != $in_ip)] + 
+            [{"inbound_ip": $in_ip, "outbound_ip": $out_ip}])
+    ' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+}
+
+# 删除IP路由规则
+# 用法: db_del_ip_routing_rule "入站IP"
+db_del_ip_routing_rule() {
+    local inbound_ip="$1"
+    [[ -z "$inbound_ip" ]] && return 1
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    local tmp=$(mktemp)
+    jq --arg in_ip "$inbound_ip" '
+        .ip_routing.rules = [(.ip_routing.rules // [])[] | select(.inbound_ip != $in_ip)]
+    ' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+}
+
+# 清空所有IP路由规则
+db_clear_ip_routing_rules() {
+    [[ ! -f "$DB_FILE" ]] && return 1
+    local tmp=$(mktemp)
+    jq '.ip_routing.rules = []' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+}
+
+# 设置IP路由启用/禁用
+db_set_ip_routing_enabled() {
+    local enabled="$1"
+    [[ ! -f "$DB_FILE" ]] && init_db
+    local tmp=$(mktemp)
+    jq --argjson e "$enabled" '.ip_routing.enabled = $e' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+}
+
+# 获取指定入站IP的出站IP
+db_get_ip_routing_outbound() {
+    local inbound_ip="$1"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    jq -r --arg in_ip "$inbound_ip" '
+        (.ip_routing.rules // [])[] | select(.inbound_ip == $in_ip) | .outbound_ip
+    ' "$DB_FILE" 2>/dev/null
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+#  用户管理函数
+#═══════════════════════════════════════════════════════════════════════════════
+
+# 检查是否为独立协议（不支持多用户和流量统计）
+is_standalone_protocol() {
+    local proto="$1"
+    [[ " $STANDALONE_PROTOCOLS " == *" $proto "* ]]
+}
+
+# 添加用户到协议 (支持多端口数组格式)
+# 用法: db_add_user "xray" "vless" "用户名" "uuid" [配额GB]
+db_add_user() {
+    local core="$1" proto="$2" name="$3" uuid="$4" quota_gb="${5:-0}"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    # 检查协议是否存在
+    if ! db_exists "$core" "$proto"; then
+        _err "协议 $proto 不存在"
+        return 1
+    fi
+    
+    # 检查是否为独立协议（不支持多用户）
+    if is_standalone_protocol "$proto"; then
+        _err "独立协议 $proto 不支持添加用户"
+        return 1
+    fi
+    
+    # 检查用户名是否已存在 (支持多端口)
+    local exists=$(jq -r --arg c "$core" --arg p "$proto" --arg n "$name" '
+        .[$c][$p] as $cfg |
+        if $cfg == null then 0
+        elif ($cfg | type) == "array" then
+            [$cfg[].users // [] | .[] | select(.name == $n)] | length
+        else
+            ($cfg.users // [] | map(select(.name == $n))) | length
+        end
+    ' "$DB_FILE" 2>/dev/null)
+    if [[ "$exists" -gt 0 ]]; then
+        _err "用户 $name 已存在"
+        return 1
+    fi
+    
+    # 计算配额(字节)
+    local quota=0
+    if [[ "$quota_gb" -gt 0 ]]; then
+        quota=$((quota_gb * 1073741824))  # GB to bytes
+    fi
+    
+    local created=$(date '+%Y-%m-%d')
+    
+    # 添加用户 (支持多端口数组)
+    local tmp_file="${DB_FILE}.tmp"
+    jq --arg c "$core" --arg p "$proto" --arg n "$name" --arg u "$uuid" \
+       --argjson q "$quota" --arg cr "$created" '
+        .[$c][$p] as $cfg |
+        if ($cfg | type) == "array" then
+            # 多端口: 添加到第一个端口实例
+            .[$c][$p][0].users = ((.[$c][$p][0].users // []) + [{name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr}])
+        else
+            # 单端口: 正常添加
+            .[$c][$p].users = ((.[$c][$p].users // []) + [{name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr}])
+        end
+    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    
+    # 自动重建配置
+    if [[ "$core" == "xray" ]]; then
+        rebuild_and_reload_xray "silent" 2>/dev/null || true
+    elif [[ "$core" == "singbox" ]]; then
+        rebuild_and_reload_singbox "silent" 2>/dev/null || true
+    fi
+}
+
+# 删除用户 (支持多端口数组格式)
+# 用法: db_del_user "xray" "vless" "用户名"
+db_del_user() {
+    local core="$1" proto="$2" name="$3"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    local tmp_file="${DB_FILE}.tmp"
+    jq --arg c "$core" --arg p "$proto" --arg n "$name" '
+        .[$c][$p] as $cfg |
+        if ($cfg | type) == "array" then
+            # 多端口: 从所有端口实例中删除该用户
+            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | select(.name != $n)])]
+        else
+            # 单端口
+            .[$c][$p].users = [.[$c][$p].users // [] | .[] | select(.name != $n)]
+        end
+    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    
+    # 自动重建配置
+    if [[ "$core" == "xray" ]]; then
+        rebuild_and_reload_xray "silent" 2>/dev/null || true
+    elif [[ "$core" == "singbox" ]]; then
+        rebuild_and_reload_singbox "silent" 2>/dev/null || true
+    fi
+}
+
+# 获取用户信息 (支持多端口数组格式)
+# 用法: db_get_user "xray" "vless" "用户名"
+db_get_user() {
+    local core="$1" proto="$2" name="$3"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    jq -r --arg c "$core" --arg p "$proto" --arg n "$name" '
+        .[$c][$p] as $cfg |
+        if $cfg == null then
+            empty
+        elif ($cfg | type) == "array" then
+            # 多端口: 合并所有端口的 users 数组查找
+            [$cfg[].users // [] | .[] | select(.name == $n)] | .[0] // empty
+        else
+            # 单端口
+            ($cfg.users // [] | map(select(.name == $n)) | .[0]) // empty
+        end
+    ' "$DB_FILE" 2>/dev/null
+}
+
+# 获取用户的某个字段 (支持多端口数组格式)
+# 用法: db_get_user_field "xray" "vless" "用户名" "uuid"
+db_get_user_field() {
+    local core="$1" proto="$2" name="$3" field="$4"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    jq -r --arg c "$core" --arg p "$proto" --arg n "$name" --arg f "$field" '
+        .[$c][$p] as $cfg |
+        if $cfg == null then
+            empty
+        elif ($cfg | type) == "array" then
+            [$cfg[].users // [] | .[] | select(.name == $n)] | .[0][$f] // empty
+        else
+            ($cfg.users // [] | map(select(.name == $n)) | .[0][$f]) // empty
+        end
+    ' "$DB_FILE" 2>/dev/null
+}
+
+# 列出协议的所有用户 (支持多端口数组格式)
+# 用法: db_list_users "xray" "vless"
+db_list_users() {
+    local core="$1" proto="$2"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    jq -r --arg c "$core" --arg p "$proto" '
+        .[$c][$p] as $cfg |
+        if $cfg == null then
+            empty
+        elif ($cfg | type) == "array" then
+            # 多端口: 合并所有端口的 users，无 users 时输出 "default"
+            ($cfg | map(
+                if (.users | length) > 0 then
+                    .users[].name
+                elif (.uuid != null or .password != null) then
+                    "default"
+                else
+                    empty
+                end
+            ) | unique | .[]) // empty
+        else
+            # 单端口
+            if ($cfg.users | length) > 0 then
+                $cfg.users[].name
+            elif ($cfg.uuid != null or $cfg.password != null) then
+                "default"
+            else
+                empty
+            end
+        end
+    ' "$DB_FILE" 2>/dev/null
+}
+
+# 获取协议的用户数量
+# 用法: db_count_users "xray" "vless"
+db_count_users() {
+    local core="$1" proto="$2"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    local count=$(jq -r --arg c "$core" --arg p "$proto" '
+        .[$c][$p] as $cfg |
+        if $cfg == null then
+            0
+        elif ($cfg | type) == "array" then
+            # 多端口数组: 统计所有端口的 users，或统计有 uuid/password 的端口数
+            ($cfg | map(.users // [] | length) | add) as $users_total |
+            if $users_total > 0 then
+                $users_total
+            else
+                # 没有 users 数组，统计有默认凭证的端口数
+                [$cfg[] | select(.uuid != null or .password != null)] | length
+            end
+        else
+            # 单端口对象
+            ($cfg.users // [] | length) as $users_len |
+            if $users_len > 0 then
+                $users_len
+            elif ($cfg.uuid != null or $cfg.password != null) then
+                1
+            else
+                0
+            end
+        end
+    ' "$DB_FILE" 2>/dev/null)
+    
+    echo "${count:-0}"
+}
+
+# 更新用户流量 (支持多端口数组格式)
+# 用法: db_update_user_traffic "xray" "vless" "用户名" 增量字节数
+db_update_user_traffic() {
+    local core="$1" proto="$2" name="$3" bytes="$4"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    local tmp_file="${DB_FILE}.tmp"
+    jq --arg c "$core" --arg p "$proto" --arg n "$name" --argjson b "$bytes" '
+        .[$c][$p] as $cfg |
+        if ($cfg | type) == "array" then
+            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | if .name == $n then .used += $b else . end])]
+        else
+            .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .used += $b else . end]
+        end
+    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+}
+
+# 设置用户流量(覆盖) (支持多端口数组格式)
+# 用法: db_set_user_traffic "xray" "vless" "用户名" 字节数
+db_set_user_traffic() {
+    local core="$1" proto="$2" name="$3" bytes="$4"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    local tmp_file="${DB_FILE}.tmp"
+    jq --arg c "$core" --arg p "$proto" --arg n "$name" --argjson b "$bytes" '
+        .[$c][$p] as $cfg |
+        if ($cfg | type) == "array" then
+            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | if .name == $n then .used = $b else . end])]
+        else
+            .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .used = $b else . end]
+        end
+    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+}
+
+# 重置用户流量
+# 用法: db_reset_user_traffic "xray" "vless" "用户名"
+db_reset_user_traffic() {
+    db_set_user_traffic "$1" "$2" "$3" 0
+}
+
+# 设置用户配额 (支持多端口数组格式)
+# 用法: db_set_user_quota "xray" "vless" "用户名" 配额GB (0=无限)
+db_set_user_quota() {
+    local core="$1" proto="$2" name="$3" quota_gb="$4"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    local quota=0
+    if [[ "$quota_gb" -gt 0 ]]; then
+        quota=$((quota_gb * 1073741824))
+    fi
+    
+    local tmp_file="${DB_FILE}.tmp"
+    jq --arg c "$core" --arg p "$proto" --arg n "$name" --argjson q "$quota" '
+        .[$c][$p] as $cfg |
+        if ($cfg | type) == "array" then
+            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | if .name == $n then .quota = $q else . end])]
+        else
+            .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .quota = $q else . end]
+        end
+    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+}
+
+# 启用/禁用用户 (支持多端口数组格式)
+# 用法: db_set_user_enabled "xray" "vless" "用户名" true/false
+db_set_user_enabled() {
+    local core="$1" proto="$2" name="$3" enabled="$4"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    local tmp_file="${DB_FILE}.tmp"
+    jq --arg c "$core" --arg p "$proto" --arg n "$name" --argjson e "$enabled" '
+        .[$c][$p] as $cfg |
+        if ($cfg | type) == "array" then
+            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | if .name == $n then .enabled = $e else . end])]
+        else
+            .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .enabled = $e else . end]
+        end
+    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    
+    # 自动重建配置
+    [[ "$core" == "xray" ]] && rebuild_and_reload_xray "silent" 2>/dev/null || true
+}
+
+# 检查用户是否超限 (支持多端口数组格式)
+# 用法: db_is_user_over_quota "xray" "vless" "用户名"
+# 返回: 0=未超限或无限制, 1=已超限
+db_is_user_over_quota() {
+    local core="$1" proto="$2" name="$3"
+    [[ ! -f "$DB_FILE" ]] && return 0
+    
+    local result=$(jq -r --arg c "$core" --arg p "$proto" --arg n "$name" '
+        .[$c][$p] as $cfg |
+        if $cfg == null then "no"
+        elif ($cfg | type) == "array" then
+            [$cfg[].users // [] | .[] | select(.name == $n)] | .[0] |
+            if . == null then "no" elif .quota == 0 then "no" elif .used >= .quota then "yes" else "no" end
+        else
+            ($cfg.users // [] | map(select(.name == $n)) | .[0]) |
+            if . == null then "no" elif .quota == 0 then "no" elif .used >= .quota then "yes" else "no" end
+        end
+    ' "$DB_FILE" 2>/dev/null)
+    
+    [[ "$result" == "yes" ]]
+}
+
+# 设置用户路由 (支持多端口数组格式)
+# 用法: db_set_user_routing "xray" "vless" "用户名" "direct|warp|chain:xxx"
+db_set_user_routing() {
+    local core="$1" proto="$2" name="$3" routing="$4"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    local tmp_file="${DB_FILE}.tmp"
+    jq --arg c "$core" --arg p "$proto" --arg n "$name" --arg r "$routing" '
+        .[$c][$p] as $cfg |
+        if ($cfg | type) == "array" then
+            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | if .name == $n then .routing = $r else . end])]
+        else
+            .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .routing = $r else . end]
+        end
+    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+}
+
+# 获取用户统计信息 (支持多端口数组格式)
+# 用法: db_get_users_stats "xray" "vless"
+# 输出: name|uuid|used|quota|enabled|port|routing (每行一个用户)
+db_get_users_stats() {
+    local core="$1" proto="$2"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    jq -r --arg c "$core" --arg p "$proto" '
+        .[$c][$p] as $cfg |
+        if $cfg == null then
+            empty
+        elif ($cfg | type) == "array" then
+            # 多端口: 输出所有端口的用户（添加端口信息）
+            $cfg[] | .port as $port | (.users // [])[] |
+            "\(.name)|\(.uuid)|\(.used // 0)|\(.quota // 0)|\(.enabled // true)|\($port)|\(.routing // "")"
+        else
+            # 单端口
+            $cfg.port as $port | ($cfg.users // [])[] |
+            "\(.name)|\(.uuid)|\(.used // 0)|\(.quota // 0)|\(.enabled // true)|\($port)|\(.routing // "")"
+        end
+    ' "$DB_FILE" 2>/dev/null
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+#  多用户配置生成辅助函数
+#═══════════════════════════════════════════════════════════════════════════════
+
+# 生成 Xray VLESS 多用户 clients 数组
+# 用法: gen_xray_vless_clients "vless" [flow] [port]
+# 输出: JSON 数组 [{id: "uuid1", email: "user@vless", flow: "..."}, ...]
+gen_xray_vless_clients() {
+    local proto="$1"
+    local flow="${2:-}"
+    local filter_port="${3:-}"
+    
+    local users=$(db_get_users_stats "xray" "$proto")
+    if [[ -z "$users" ]]; then
+        # 尝试从配置中获取默认 UUID（支持多端口数组）
+        local config=$(db_get "xray" "$proto")
+        if [[ -n "$config" && "$config" != "null" ]]; then
+            # 检查是否为数组
+            if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                # 多端口：优先按端口过滤，其次取第一个端口的 uuid
+                local uuid=""
+                if [[ -n "$filter_port" ]]; then
+                    uuid=$(echo "$config" | jq -r --arg port "$filter_port" '.[] | select(.port == ($port | tonumber)) | .uuid // empty' | head -n1)
+                else
+                    uuid=$(echo "$config" | jq -r '.[0].uuid // empty')
+                fi
+                if [[ -n "$uuid" ]]; then
+                    if [[ -n "$flow" ]]; then
+                        echo "[{\"id\":\"$uuid\",\"email\":\"default@${proto}\",\"flow\":\"$flow\"}]"
+                    else
+                        echo "[{\"id\":\"$uuid\",\"email\":\"default@${proto}\"}]"
+                    fi
+                    return
+                fi
+            else
+                # 单端口
+                local uuid=$(echo "$config" | jq -r '.uuid // empty')
+                if [[ -n "$uuid" ]]; then
+                    if [[ -n "$flow" ]]; then
+                        echo "[{\"id\":\"$uuid\",\"email\":\"default@${proto}\",\"flow\":\"$flow\"}]"
+                    else
+                        echo "[{\"id\":\"$uuid\",\"email\":\"default@${proto}\"}]"
+                    fi
+                    return
+                fi
+            fi
+        fi
+        echo "[]"
+        return
+    fi
+    
+    local clients="[]"
+    declare -A seen_emails=()
+    while IFS='|' read -r name uuid used quota enabled port routing; do
+        [[ -z "$name" || -z "$uuid" || "$enabled" != "true" ]] && continue
+        [[ -n "$filter_port" && "$port" != "$filter_port" ]] && continue
+        local email="${name}@${proto}"
+        [[ -n "${seen_emails[$email]+x}" ]] && continue
+        seen_emails["$email"]=1
+        
+        if [[ -n "$flow" ]]; then
+            clients=$(echo "$clients" | jq --arg id "$uuid" --arg e "$email" --arg f "$flow" '. + [{id: $id, email: $e, flow: $f}]')
+        else
+            clients=$(echo "$clients" | jq --arg id "$uuid" --arg e "$email" '. + [{id: $id, email: $e}]')
+        fi
+    done <<< "$users"
+    
+    echo "$clients"
+}
+
+# 生成 Xray VMess 多用户 clients 数组
+gen_xray_vmess_clients() {
+    local proto="$1"
+    
+    local users=$(db_get_users_stats "xray" "$proto")
+    if [[ -z "$users" ]]; then
+        # 尝试从配置中获取默认 UUID（支持多端口数组）
+        local config=$(db_get "xray" "$proto")
+        if [[ -n "$config" && "$config" != "null" ]]; then
+            if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                local uuid=$(echo "$config" | jq -r '.[0].uuid // empty')
+            else
+                local uuid=$(echo "$config" | jq -r '.uuid // empty')
+            fi
+            if [[ -n "$uuid" ]]; then
+                echo "[{\"id\":\"$uuid\",\"email\":\"default@${proto}\",\"alterId\":0}]"
+                return
+            fi
+        fi
+        echo "[]"
+        return
+    fi
+    
+    local clients="[]"
+    while IFS='|' read -r name uuid used quota enabled port routing; do
+        [[ -z "$name" || -z "$uuid" || "$enabled" != "true" ]] && continue
+        local email="${name}@${proto}"
+        clients=$(echo "$clients" | jq --arg id "$uuid" --arg e "$email" '. + [{id: $id, email: $e, alterId: 0}]')
+    done <<< "$users"
+    
+    echo "$clients"
+}
+
+# 生成 Xray Trojan 多用户 clients 数组
+gen_xray_trojan_clients() {
+    local proto="$1"
+    
+    local users=$(db_get_users_stats "xray" "$proto")
+    if [[ -z "$users" ]]; then
+        # 尝试从配置中获取默认 password（支持多端口数组）
+        local config=$(db_get "xray" "$proto")
+        if [[ -n "$config" && "$config" != "null" ]]; then
+            if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                local password=$(echo "$config" | jq -r '.[0].password // empty')
+            else
+                local password=$(echo "$config" | jq -r '.password // empty')
+            fi
+            if [[ -n "$password" ]]; then
+                echo "[{\"password\":\"$password\",\"email\":\"default@${proto}\"}]"
+                return
+            fi
+        fi
+        echo "[]"
+        return
+    fi
+    
+    local clients="[]"
+    while IFS='|' read -r name uuid used quota enabled port routing; do
+        [[ -z "$name" || -z "$uuid" || "$enabled" != "true" ]] && continue
+        local email="${name}@${proto}"
+        # Trojan 使用 password 字段，这里 uuid 实际存储的是 password
+        clients=$(echo "$clients" | jq --arg pw "$uuid" --arg e "$email" '. + [{password: $pw, email: $e}]')
+    done <<< "$users"
+    
+    echo "$clients"
+}
+
+# 生成 Xray SS2022 多用户 clients 数组
+gen_xray_ss2022_clients() {
+    local proto="$1"
+    
+    local users=$(db_get_users_stats "xray" "$proto")
+    if [[ -z "$users" ]]; then
+        # SS2022 多用户模式必须有 users 数组，返回空
+        echo "[]"
+        return
+    fi
+    
+    local clients="[]"
+    while IFS='|' read -r name uuid used quota enabled port routing; do
+        [[ -z "$name" || -z "$uuid" || "$enabled" != "true" ]] && continue
+        local email="${name}@${proto}"
+        # SS2022 使用 password 字段
+        clients=$(echo "$clients" | jq --arg pw "$uuid" --arg e "$email" '. + [{password: $pw, email: $e}]')
+    done <<< "$users"
+    
+    echo "$clients"
+}
+
+# 生成 Xray SOCKS5 多用户 accounts 数组
+gen_xray_socks_accounts() {
+    local proto="$1"
+    
+    local users=$(db_get_users_stats "xray" "$proto")
+    if [[ -z "$users" ]]; then
+        # 尝试从配置中获取默认账号（支持多端口数组）
+        local config=$(db_get "xray" "$proto")
+        if [[ -n "$config" && "$config" != "null" ]]; then
+            local username password
+            if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                username=$(echo "$config" | jq -r '.[0].username // empty')
+                password=$(echo "$config" | jq -r '.[0].password // empty')
+            else
+                username=$(echo "$config" | jq -r '.username // empty')
+                password=$(echo "$config" | jq -r '.password // empty')
+            fi
+            if [[ -n "$username" && -n "$password" ]]; then
+                echo "[{\"user\":\"$username\",\"pass\":\"$password\"}]"
+                return
+            fi
+        fi
+        echo "[]"
+        return
+    fi
+    
+    local accounts="[]"
+    while IFS='|' read -r name uuid used quota enabled port routing; do
+        [[ -z "$name" || -z "$uuid" || "$enabled" != "true" ]] && continue
+        # SOCKS5: name 是 username，uuid 是 password
+        accounts=$(echo "$accounts" | jq --arg u "$name" --arg p "$uuid" '. + [{user: $u, pass: $p}]')
+    done <<< "$users"
+    
+    echo "$accounts"
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+#  流量格式化和辅助函数
+#═══════════════════════════════════════════════════════════════════════════════
+
+# 格式化流量显示
+# 用法: format_bytes 1073741824  -> "1.00 GB"
+format_bytes() {
+    local bytes="$1"
+    if [[ "$bytes" -ge 1099511627776 ]]; then
+        awk "BEGIN {printf \"%.2f TB\", $bytes/1099511627776}"
+    elif [[ "$bytes" -ge 1073741824 ]]; then
+        awk "BEGIN {printf \"%.2f GB\", $bytes/1073741824}"
+    elif [[ "$bytes" -ge 1048576 ]]; then
+        awk "BEGIN {printf \"%.2f MB\", $bytes/1048576}"
+    elif [[ "$bytes" -ge 1024 ]]; then
+        awk "BEGIN {printf \"%.2f KB\", $bytes/1024}"
+    else
+        echo "${bytes} B"
+    fi
+}
+
+# 获取用户路由 (支持多端口数组格式)
+db_get_user_routing() {
+    local core="$1" proto="$2" name="$3"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    jq -r --arg c "$core" --arg p "$proto" --arg n "$name" '
+        .[$c][$p] as $cfg |
+        if $cfg == null then ""
+        elif ($cfg | type) == "array" then
+            [$cfg[].users // [] | .[] | select(.name == $n)] | .[0].routing // ""
+        else
+            ($cfg.users // [] | map(select(.name == $n)) | .[0].routing) // ""
+        end
+    ' "$DB_FILE" 2>/dev/null
+}
+
+# 格式化显示用户路由
+_format_user_routing() {
+    local routing="$1"
+    case "$routing" in
+        ""|null) echo "全局规则" ;;
+        direct) echo "直连" ;;
+        warp) echo "WARP" ;;
+        chain:*) echo "链路→${routing#chain:}" ;;
+        balancer:*) echo "负载→${routing#balancer:}" ;;
+        *) echo "$routing" ;;
+    esac
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+#  TG 通知配置
+#═══════════════════════════════════════════════════════════════════════════════
+
+readonly TG_CONFIG_FILE="$CFG/telegram.json"
+
+# 初始化 TG 配置
+init_tg_config() {
+    [[ -f "$TG_CONFIG_FILE" ]] && return 0
+    echo '{"enabled":false,"bot_token":"","chat_id":"","notify_quota_percent":80,"notify_daily":false}' > "$TG_CONFIG_FILE"
+}
+
+# 获取 TG 配置
+tg_get_config() {
+    local field="$1"
+    [[ ! -f "$TG_CONFIG_FILE" ]] && init_tg_config
+    jq -r ".$field // empty" "$TG_CONFIG_FILE" 2>/dev/null
+}
+
+# 设置 TG 配置
+tg_set_config() {
+    local field="$1" value="$2"
+    [[ ! -f "$TG_CONFIG_FILE" ]] && init_tg_config
+    
+    local tmp=$(mktemp)
+    if [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" == "true" ]] || [[ "$value" == "false" ]]; then
+        jq --arg f "$field" --argjson v "$value" '.[$f] = $v' "$TG_CONFIG_FILE" > "$tmp"
+    else
+        jq --arg f "$field" --arg v "$value" '.[$f] = $v' "$TG_CONFIG_FILE" > "$tmp"
+    fi
+    mv "$tmp" "$TG_CONFIG_FILE"
+}
+
+# 发送 TG 消息
+tg_send_message() {
+    local message="$1"
+    local bot_token=$(tg_get_config "bot_token")
+    local chat_id=$(tg_get_config "chat_id")
+    local enabled=$(tg_get_config "enabled")
+    
+    [[ "$enabled" != "true" ]] && return 0
+    [[ -z "$bot_token" || -z "$chat_id" ]] && return 1
+    
+    curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
+        -d "chat_id=${chat_id}" \
+        -d "text=${message}" \
+        -d "parse_mode=Markdown" \
+        --connect-timeout 10 \
+        >/dev/null 2>&1
+}
+
+# 发送流量告警
+tg_send_quota_alert() {
+    local user="$1" proto="$2" used="$3" quota="$4" percent="$5"
+    local server_ip=$(get_ipv4)
+    
+    local message="⚠️ *流量告警*
+
+服务器: \`${server_ip}\`
+协议: ${proto}
+用户: ${user}
+已用: $(format_bytes $used)
+配额: $(format_bytes $quota)
+使用率: ${percent}%"
+    
+    tg_send_message "$message"
+}
+
+# 发送超限通知
+tg_send_over_quota() {
+    local user="$1" proto="$2" used="$3" quota="$4"
+    local server_ip=$(get_ipv4)
+    
+    local message="🚫 *流量超限*
+
+服务器: \`${server_ip}\`
+协议: ${proto}
+用户: ${user}
+已用: $(format_bytes $used)
+配额: $(format_bytes $quota)
+
+用户已被自动禁用"
+    
+    tg_send_message "$message"
+}
+
+# 发送每日流量报告
+tg_send_daily_report() {
+    local server_ip=$(get_ipv4)
+    [[ -z "$server_ip" ]] && server_ip=$(get_ipv6)
+    
+    local report="📊 *每日流量报告*
+服务器: \`${server_ip}\`
+时间: $(date '+%Y-%m-%d %H:%M')
+━━━━━━━━━━━━━━━━━━━━"
+    
+    local total_users=0
+    local total_used=0
+    local user_details=""
+    
+    # 遍历所有协议的用户
+    for core in xray singbox; do
+        local protocols=$(db_list_protocols "$core" 2>/dev/null)
+        [[ -z "$protocols" ]] && continue
+        
+        for proto in $protocols; do
+            local stats=$(db_get_users_stats "$core" "$proto" 2>/dev/null)
+            [[ -z "$stats" ]] && continue
+            
+            while IFS='|' read -r name uuid used quota enabled port routing; do
+                [[ -z "$name" ]] && continue
+                ((total_users++))
+                total_used=$((total_used + used))
+                
+                local status_icon="✅"
+                [[ "$enabled" != "true" ]] && status_icon="❌"
+                
+                local used_fmt=$(format_bytes "$used")
+                local quota_fmt="∞"
+                local percent_str=""
+                
+                if [[ "$quota" -gt 0 ]]; then
+                    quota_fmt=$(format_bytes "$quota")
+                    local percent=$((used * 100 / quota))
+                    percent_str=" (${percent}%)"
+                fi
+                
+                user_details+="
+${status_icon} *${name}* (${proto})
+   ${used_fmt} / ${quota_fmt}${percent_str}"
+            done <<< "$stats"
+        done
+    done
+    
+    report+="
+总用户: ${total_users}
+总流量: $(format_bytes $total_used)
+━━━━━━━━━━━━━━━━━━━━"
+    
+    if [[ -n "$user_details" ]]; then
+        report+="
+*用户详情:*${user_details}"
+    fi
+    
+    tg_send_message "$report"
+}
+
+# 检查是否需要发送每日报告
+check_daily_report() {
+    local enabled=$(tg_get_config "enabled")
+    local daily_enabled=$(tg_get_config "notify_daily")
+    
+    [[ "$enabled" != "true" || "$daily_enabled" != "true" ]] && return 0
+    
+    local report_hour=$(tg_get_config "daily_report_hour")
+    local report_minute=$(tg_get_config "daily_report_minute")
+    report_hour=${report_hour:-9}
+    report_minute=${report_minute:-0}
+    
+    local current_hour=$(date '+%H' | sed 's/^0//')
+    local current_minute=$(date '+%M' | sed 's/^0//')
+    local last_report_date=$(tg_get_config "last_report_date")
+    local today=$(date '+%Y-%m-%d')
+    
+    local interval=$(get_traffic_interval)
+    interval=${interval:-5}
+    
+    if [[ "$current_hour" -eq "$report_hour" && 
+          "$current_minute" -ge "$report_minute" && 
+          "$current_minute" -lt "$((report_minute + interval))" && 
+          "$last_report_date" != "$today" ]]; then
+        tg_send_daily_report
+        tg_set_config "last_report_date" "$today"
+    fi
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+#  流量统计函数 - 基于 Xray Stats API
+#═══════════════════════════════════════════════════════════════════════════════
+
+readonly XRAY_API_PORT=10085
+readonly TRAFFIC_INTERVAL_FILE="$CFG/traffic_interval"
+
+# 查询 Xray Stats API
+xray_api_query() {
+    local pattern="$1"
+    local reset="${2:-false}"
+    
+    if ! command -v xray &>/dev/null; then
+        return 1
+    fi
+    
+    local cmd="xray api statsquery --server=127.0.0.1:${XRAY_API_PORT}"
+    [[ "$reset" == "true" ]] && cmd+=" -reset"
+    [[ -n "$pattern" ]] && cmd+=" -pattern \"$pattern\""
+    
+    eval "$cmd" 2>/dev/null
+}
+
+# 获取用户流量 (上行+下行)
+get_user_traffic() {
+    local email="$1"
+    local reset="${2:-false}"
+    
+    local uplink=0 downlink=0
+    
+    local up_result=$(xray_api_query "user>>>$email>>>traffic>>>uplink" "$reset" 2>/dev/null)
+    if [[ -n "$up_result" ]]; then
+        uplink=$(echo "$up_result" | jq -r '.stat[]? | select((.name // .Name) | contains("uplink")) | (.value // .Value // 0)' 2>/dev/null | head -1)
+        if [[ -z "$uplink" || "$uplink" == "null" ]]; then
+            uplink=$(echo "$up_result" | grep -oiE '"value"[[:space:]]*:[[:space:]]*[0-9]+' | head -1 | grep -o '[0-9]*')
+        fi
+        uplink=${uplink:-0}
+    fi
+    
+    local down_result=$(xray_api_query "user>>>$email>>>traffic>>>downlink" "$reset" 2>/dev/null)
+    if [[ -n "$down_result" ]]; then
+        downlink=$(echo "$down_result" | jq -r '.stat[]? | select((.name // .Name) | contains("downlink")) | (.value // .Value // 0)' 2>/dev/null | head -1)
+        if [[ -z "$downlink" || "$downlink" == "null" ]]; then
+            downlink=$(echo "$down_result" | grep -oiE '"value"[[:space:]]*:[[:space:]]*[0-9]+' | head -1 | grep -o '[0-9]*')
+        fi
+        downlink=${downlink:-0}
+    fi
+    
+    echo $((uplink + downlink))
+}
+
+# 同步所有用户流量到数据库
+sync_all_user_traffic() {
+    local reset="${1:-true}"
+    
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    check_daily_report
+    
+    if ! _pgrep xray; then
+        return 0
+    fi
+    
+    local tmp_stats=$(mktemp)
+    trap "rm -f '$tmp_stats'" RETURN
+    
+    local reset_flag=""
+    [[ "$reset" == "true" ]] && reset_flag="-reset"
+    
+    if ! xray api statsquery --server=127.0.0.1:${XRAY_API_PORT} $reset_flag 2>/dev/null | \
+         jq -r '.stat[]? | "\(.name // .Name) \(.value // .Value // 0)"' > "$tmp_stats" 2>/dev/null; then
+        rm -f "$tmp_stats"
+        return 1
+    fi
+    
+    [[ ! -s "$tmp_stats" ]] && { rm -f "$tmp_stats"; return 0; }
+    
+    local updated=0
+    local need_reload=false
+    local notify_percent=$(tg_get_config "notify_quota_percent")
+    notify_percent=${notify_percent:-80}
+    
+    local -a alert_thresholds=(80 90 95)
+    
+    for proto in $(db_list_protocols "xray"); do
+        local users=$(db_list_users "xray" "$proto")
+        [[ -z "$users" ]] && continue
+        
+        for user in $users; do
+            local email="${user}@${proto}"
+            
+            local uplink=$(grep -F "user>>>${email}>>>traffic>>>uplink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
+            local downlink=$(grep -F "user>>>${email}>>>traffic>>>downlink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
+            
+            uplink=${uplink:-0}
+            downlink=${downlink:-0}
+            local traffic=$((uplink + downlink))
+            
+            if [[ "$traffic" -gt 0 ]]; then
+                db_update_user_traffic "xray" "$proto" "$user" "$traffic"
+                ((updated++))
+                
+                local quota=$(db_get_user_field "xray" "$proto" "$user" "quota")
+                local used=$(db_get_user_field "xray" "$proto" "$user" "used")
+                
+                if [[ "$quota" -gt 0 ]]; then
+                    local percent=$((used * 100 / quota))
+                    
+                    if [[ "$used" -ge "$quota" ]]; then
+                        local exceeded_notified=$(db_get_user_field "xray" "$proto" "$user" "quota_exceeded_notified")
+                        if [[ "$exceeded_notified" != "true" ]]; then
+                            db_set_user_enabled "xray" "$proto" "$user" "false"
+                            tg_send_over_quota "$user" "$proto" "$used" "$quota"
+                            need_reload=true
+                        fi
+                    elif [[ "$percent" -ge "$notify_percent" ]]; then
+                        local last_alert=$(db_get_user_field "xray" "$proto" "$user" "last_alert_percent")
+                        last_alert=${last_alert:-0}
+                        
+                        local should_alert=false
+                        local current_threshold=0
+                        for threshold in "${alert_thresholds[@]}"; do
+                            if [[ "$percent" -ge "$threshold" && "$last_alert" -lt "$threshold" ]]; then
+                                should_alert=true
+                                current_threshold=$threshold
+                            fi
+                        done
+                        
+                        if [[ "$should_alert" == "true" ]]; then
+                            tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent"
+                        fi
+                    fi
+                fi
+            fi
+        done
+    done
+    
+    rm -f "$tmp_stats"
+    
+    if [[ "$need_reload" == "true" ]]; then
+        generate_xray_config 2>/dev/null
+        svc restart vless-reality 2>/dev/null
+    fi
+    
+    return 0
+}
+
+# 获取所有用户流量统计 (用于显示)
+get_all_traffic_stats() {
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    local tmp_stats=$(mktemp)
+    trap "rm -f '$tmp_stats'" RETURN
+    
+    if _pgrep xray &>/dev/null; then
+        if xray api statsquery --server=127.0.0.1:${XRAY_API_PORT} 2>/dev/null | \
+             jq -r '.stat[]? | "\(.name // .Name) \(.value // .Value // 0)"' > "$tmp_stats" 2>/dev/null; then
+            
+            if [[ -s "$tmp_stats" ]]; then
+                for proto in $(db_list_protocols "xray"); do
+                    local users=$(db_list_users "xray" "$proto")
+                    [[ -z "$users" ]] && continue
+                    
+                    for user in $users; do
+                        local email="${user}@${proto}"
+                        
+                        local uplink=$(grep -F "user>>>${email}>>>traffic>>>uplink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
+                        local downlink=$(grep -F "user>>>${email}>>>traffic>>>downlink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
+                        
+                        uplink=${uplink:-0}
+                        downlink=${downlink:-0}
+                        
+                        local total=$((uplink + downlink))
+                        if [[ "$total" -gt 0 ]]; then
+                            echo "${proto}|${user}|${uplink}|${downlink}|${total}"
+                        fi
+                    done
+                done
+            fi
+        fi
+    fi
+    
+    rm -f "$tmp_stats"
+}
+
+# 获取流量检测间隔 (分钟)
+get_traffic_interval() {
+    if [[ -f "$TRAFFIC_INTERVAL_FILE" ]]; then
+        cat "$TRAFFIC_INTERVAL_FILE"
+    else
+        echo "5"
+    fi
+}
+
+# 设置流量检测间隔
+set_traffic_interval() {
+    local interval="$1"
+    echo "$interval" > "$TRAFFIC_INTERVAL_FILE"
+}
+
+# 创建流量统计定时任务
+setup_traffic_cron() {
+    local interval="${1:-$(get_traffic_interval)}"
+    local script_path=$(readlink -f "$0")
+    local cron_cmd="*/$interval * * * * $script_path --sync-traffic >/dev/null 2>&1"
+    
+    crontab -l 2>/dev/null | grep -v "sync-traffic" | crontab - 2>/dev/null
+    (crontab -l 2>/dev/null; echo "$cron_cmd") | crontab -
+    
+    set_traffic_interval "$interval"
+    _ok "已添加流量统计定时任务 (每${interval}分钟)"
+}
+
+# 移除流量统计定时任务
+remove_traffic_cron() {
+    crontab -l 2>/dev/null | grep -v "sync-traffic" | crontab -
+    _ok "已移除流量统计定时任务"
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
 #  通用配置保存函数
 #═══════════════════════════════════════════════════════════════════════════════
+
 
 # 简化版：直接用关联数组构建 JSON
 # 用法: build_config "uuid" "$uuid" "port" "$port" "sni" "$sni"
@@ -1518,7 +2604,242 @@ diagnose_certificate() {
     echo ""
 }
 
-# 创建伪装网页
+#═══════════════════════════════════════════════════════════════════════════════
+# Nginx 配置生成(统一函数)
+#═══════════════════════════════════════════════════════════════════════════════
+
+# 生成统一格式的Nginx配置文件
+# 用法: generate_nginx_config <配置文件路径> <域名> <订阅端口> [模式] [回落端口] [web目录]
+# 模式: full(默认)=本地回落+公网SSL, simple=仅HTTP单端口, reality=Reality协议HTTP订阅
+generate_nginx_config() {
+    local conf_file="$1"
+    local domain="${2:-_}"
+    local nginx_port="${3:-2096}"    # 公网订阅端口
+    local mode="${4:-full}"
+    local fb_port="${5:-8443}"       # Xray回落端口
+    local web_dir="${6:-/var/www/html}"
+    
+    # 确保目录存在
+    mkdir -p "$(dirname "$conf_file")"
+    
+    # 生成配置文件名（用于日志）
+    local conf_name="${domain}"
+    [[ "$conf_name" == "_" || -z "$conf_name" ]] && conf_name="vless-server"
+    
+    case "$mode" in
+        full)
+            # 完整模式: 80重定向 + 单server块同时监听本地回落和公网SSL
+            # 格式参考 openlist.181028.xyz (nginx-acme自动证书)
+            cat > "$conf_file" << EOF
+# ${conf_name} Nginx 配置 (由 vless-server.sh 自动生成)
+# 域名: ${domain}
+# 回落端口: ${fb_port} (Xray TLS解密后回落)
+# 订阅端口: ${nginx_port} (公网HTTPS直接访问)
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain};
+    
+    location /.well-known/acme-challenge/ { root ${web_dir}; }
+    location / { return 301 https://\$host\$request_uri; }
+}
+
+server {
+    listen 127.0.0.1:${fb_port};
+    listen ${nginx_port};
+    listen [::]:${nginx_port};
+    listen ${nginx_port} ssl;
+    listen [::]:${nginx_port} ssl;
+    http2 on;
+    server_name ${domain};
+    
+    # nginx-acme 自动证书管理
+    acme_certificate letsencrypt;
+    ssl_certificate \$acme_certificate;
+    ssl_certificate_key \$acme_certificate_key;
+    ssl_certificate_cache max=2;
+    
+    # 日志
+    access_log /var/log/nginx/${conf_name}-access.log main buffer=64k flush=10s;
+    error_log /var/log/nginx/${conf_name}-error.log warn;
+    
+    root ${web_dir};
+    index index.html;
+    
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+    
+    # 订阅文件目录 - v2ray 映射到 base64
+    location ~ ^/sub/([a-f0-9-]+)/v2ray\$ {
+        alias ${CFG}/subscription/\$1/base64;
+        default_type text/plain;
+        add_header Content-Type "text/plain; charset=utf-8";
+    }
+    
+    location ~ ^/sub/([a-f0-9-]+)/clash\$ {
+        alias ${CFG}/subscription/\$1/clash.yaml;
+        default_type text/yaml;
+    }
+    
+    location ~ ^/sub/([a-f0-9-]+)/surge\$ {
+        alias ${CFG}/subscription/\$1/surge.conf;
+        default_type text/plain;
+    }
+    
+    # Sing-box 订阅
+    location ~ ^/sub/([a-f0-9-]+)/singbox\$ {
+        alias ${CFG}/subscription/\$1/singbox.json;
+        default_type application/json;
+    }
+    
+    location /sub/ {
+        alias ${CFG}/subscription/;
+        autoindex off;
+        default_type text/plain;
+    }
+    
+    server_tokens off;
+}
+EOF
+            ;;
+        reality)
+            # Reality模式: 纯HTTP订阅服务 (Reality协议自己处理TLS)
+            cat > "$conf_file" << EOF
+# ${conf_name} Nginx 配置 (由 vless-server.sh 自动生成)
+# 域名: ${domain}
+# 订阅端口: ${sub_port}
+# 模式: reality (纯HTTP订阅服务)
+
+server {
+    listen 0.0.0.0:${sub_port};
+    listen [::]:${sub_port};
+    server_name ${domain};
+    
+    root ${web_dir};
+    index index.html;
+    
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+    
+    # 订阅文件目录 - v2ray 映射到 base64
+    location ~ ^/sub/([a-f0-9-]+)/v2ray\$ {
+        alias ${CFG}/subscription/\$1/base64;
+        default_type text/plain;
+        add_header Content-Type "text/plain; charset=utf-8";
+    }
+    
+    location ~ ^/sub/([a-f0-9-]+)/clash\$ {
+        alias ${CFG}/subscription/\$1/clash.yaml;
+        default_type text/yaml;
+    }
+    
+    location ~ ^/sub/([a-f0-9-]+)/surge\$ {
+        alias ${CFG}/subscription/\$1/surge.conf;
+        default_type text/plain;
+    }
+    
+    location ~ ^/sub/([a-f0-9-]+)/singbox\$ {
+        alias ${CFG}/subscription/\$1/singbox.json;
+        default_type application/json;
+    }
+    
+    location /sub/ {
+        alias ${CFG}/subscription/;
+        autoindex off;
+        default_type text/plain;
+    }
+    
+    server_tokens off;
+}
+EOF
+            ;;
+        simple)
+            # 简单模式: 仅HTTP单端口 (用于测试或特殊场景)
+            cat > "$conf_file" << EOF
+# ${conf_name} Nginx 配置 (由 vless-server.sh 自动生成)
+# 域名: ${domain}
+# 端口: ${sub_port}
+# 模式: simple (仅HTTP单端口)
+
+server {
+    listen ${sub_port};
+    listen [::]:${sub_port};
+    server_name ${domain};
+    
+    root ${web_dir};
+    index index.html;
+    
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+    
+    location /sub/ {
+        alias ${CFG}/subscription/;
+        autoindex off;
+        default_type text/plain;
+    }
+    
+    server_tokens off;
+}
+EOF
+            ;;
+    esac
+    
+    return 0
+}
+
+# 应用Nginx配置并重载服务
+# 用法: apply_nginx_config [配置文件路径] [sites-enabled软链接名]
+apply_nginx_config() {
+    local conf_file="$1"
+    local link_name="$2"
+    
+    # 如果需要创建软链接
+    if [[ -n "$link_name" && -d "/etc/nginx/sites-enabled" && -f "$conf_file" ]]; then
+        mkdir -p /etc/nginx/sites-enabled
+        ln -sf "$conf_file" "/etc/nginx/sites-enabled/$link_name"
+    fi
+    
+    # 测试配置
+    if ! nginx -t >/dev/null 2>&1; then
+        _err "Nginx 配置测试失败"
+        nginx -t
+        return 1
+    fi
+    
+    # 重载Nginx
+    if [[ "$DISTRO" == "alpine" ]]; then
+        rc-service nginx reload 2>/dev/null || nginx -s reload
+    else
+        systemctl reload nginx 2>/dev/null || nginx -s reload
+    fi
+    
+    return 0
+}
+
+# 清理旧的Nginx配置文件
+# 用法: cleanup_nginx_configs <配置名称>
+cleanup_nginx_configs() {
+    local name="$1"
+    
+    # 清理各种可能的旧配置
+    rm -f "/etc/nginx/sites-available/$name" 2>/dev/null
+    rm -f "/etc/nginx/sites-enabled/$name" 2>/dev/null
+    rm -f "/etc/nginx/conf.d/$name.conf" 2>/dev/null
+    rm -f "/etc/nginx/http.d/$name.conf" 2>/dev/null
+    
+    # 清理固定名称的旧配置
+    rm -f /etc/nginx/conf.d/vless-sub.conf 2>/dev/null
+    rm -f /etc/nginx/conf.d/vless-fake.conf 2>/dev/null
+    rm -f /etc/nginx/sites-available/vless-fake 2>/dev/null
+    rm -f /etc/nginx/sites-enabled/vless-fake 2>/dev/null
+    rm -f /etc/nginx/sites-available/config-only 2>/dev/null
+    rm -f /etc/nginx/sites-enabled/config-only 2>/dev/null
+}
+
 # 创建伪装网页
 create_fake_website() {
     local domain="$1"
@@ -1680,229 +3001,17 @@ EOF
         fi
         
         if [[ "$detected_protocol" == "vless" || "$detected_protocol" == "vless-xhttp" ]]; then
-            # Reality协议：Nginx独立运行，提供HTTP订阅服务
+            # Reality协议：纯HTTP订阅服务
             nginx_port="${custom_nginx_port:-8080}"
-            nginx_listen="0.0.0.0:$nginx_port"
-            nginx_comment="独立提供订阅服务 (HTTP)，不与Reality冲突"
-            
-            # 使用域名命名的配置文件
-            cat > "$nginx_conf_file" << EOF
-server {
-    listen $nginx_listen;
-    server_name $domain;
-EOF
+            generate_nginx_config "$nginx_conf_file" "$domain" "$nginx_port" "reality" "$fb_port" "$web_dir"
         elif [[ "$detected_protocol" == "vless-vision" || "$detected_protocol" == "vless-ws" || "$detected_protocol" == "vmess-ws" || "$detected_protocol" == "trojan" || "$detected_protocol" == "config-only" ]]; then
-            # 证书协议：Nginx 同时监听 fb_port (fallback) 和自定义端口 (HTTPS订阅)
-            nginx_port="${custom_nginx_port:-2086}"
-            
-            # 使用域名命名的软链接（如果支持）
-            local conf_name="vless-fake"
-            [[ "$use_sites_available" == "true" ]] && conf_name="$domain"
-            
-            if [[ "$nginx_port" == "$fb_port" ]]; then
-                # 同端口模式 (8443 同时处理回落和直接订阅)
-                cat > "$nginx_conf_file" << EOF
-server {
-    listen 127.0.0.1:$fb_port;
-    listen 0.0.0.0:$fb_port ssl;
-    listen [::]:$fb_port ssl;
-    http2 on;
-    server_name $domain;
-    
-    ssl_certificate /etc/vless-reality/certs/server.crt;
-    ssl_certificate_key /etc/vless-reality/certs/server.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    
-    root $web_dir;
-    index index.html;
-    
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-    
-    # 订阅路由
-    location ~ ^/sub/([a-f0-9-]+)/v2ray\$ {
-        alias $CFG/subscription/\$1/base64;
-        default_type text/plain;
-        add_header Content-Type "text/plain; charset=utf-8";
-    }
-    
-    location ~ ^/sub/([a-f0-9-]+)/clash\$ {
-        alias $CFG/subscription/\$1/clash.yaml;
-        default_type text/yaml;
-    }
-    
-    location ~ ^/sub/([a-f0-9-]+)/surge\$ {
-        alias $CFG/subscription/\$1/surge.conf;
-        default_type text/plain;
-    }
-    
-    location ~ ^/sub/([a-f0-9-]+)/singbox\$ {
-        alias $CFG/subscription/\$1/singbox.json;
-        default_type application/json;
-    }
-    
-    location /sub/ {
-        alias $CFG/subscription/;
-        autoindex off;
-        default_type text/plain;
-    }
-    
-    server_tokens off;
-}
-EOF
-            else
-                # 双端口模式: 回落端口 (本地监听) + 独立订阅端口 (公网监听)
-                # 注意: Xray 回落的流量已经是解密后的 HTTP，所以回落后端不需要 SSL
-                cat > "$nginx_conf_file" << EOF
-# Fallback 后端 (供 Xray 回落使用 - 本地监听，无 SSL)
-# Xray 在 TLS 握手后将非代理流量回落到此端口，流量已解密
-server {
-    listen 127.0.0.1:$fb_port;
-    server_name $domain;
-    
-    root $web_dir;
-    index index.html;
-    
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-    
-    # 订阅文件目录 - v2ray 映射到 base64
-    location ~ ^/sub/([a-f0-9-]+)/v2ray\$ {
-        alias $CFG/subscription/\$1/base64;
-        default_type text/plain;
-        add_header Content-Type "text/plain; charset=utf-8";
-    }
-    
-    location ~ ^/sub/([a-f0-9-]+)/clash\$ {
-        alias $CFG/subscription/\$1/clash.yaml;
-        default_type text/yaml;
-    }
-    
-    location ~ ^/sub/([a-f0-9-]+)/surge\$ {
-        alias $CFG/subscription/\$1/surge.conf;
-        default_type text/plain;
-    }
-    
-    # Sing-box 订阅
-    location ~ ^/sub/([a-f0-9-]+)/singbox\$ {
-        alias $CFG/subscription/\$1/singbox.json;
-        default_type application/json;
-    }
-    
-    location /sub/ {
-        alias $CFG/subscription/;
-        autoindex off;
-        default_type text/plain;
-    }
-    
-    server_tokens off;
-}
-
-# HTTPS 订阅服务 (独立端口，公网直接访问)
-server {
-    listen 0.0.0.0:$nginx_port ssl;
-    listen [::]:$nginx_port ssl;
-    http2 on;
-    server_name $domain;
-    
-    ssl_certificate /etc/vless-reality/certs/server.crt;
-    ssl_certificate_key /etc/vless-reality/certs/server.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    
-    root $web_dir;
-    index index.html;
-    
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-    
-    # 订阅文件目录 - v2ray 映射到 base64
-    location ~ ^/sub/([a-f0-9-]+)/v2ray\$ {
-        alias $CFG/subscription/\$1/base64;
-        default_type text/plain;
-        add_header Content-Type "text/plain; charset=utf-8";
-    }
-    
-    location ~ ^/sub/([a-f0-9-]+)/clash\$ {
-        alias $CFG/subscription/\$1/clash.yaml;
-        default_type text/yaml;
-    }
-    
-    location ~ ^/sub/([a-f0-9-]+)/surge\$ {
-        alias $CFG/subscription/\$1/surge.conf;
-        default_type text/plain;
-    }
-    
-    # Sing-box 订阅
-    location ~ ^/sub/([a-f0-9-]+)/singbox\$ {
-        alias $CFG/subscription/\$1/singbox.json;
-        default_type application/json;
-    }
-    
-    location /sub/ {
-        alias $CFG/subscription/;
-        autoindex off;
-        default_type text/plain;
-    }
-    
-    server_tokens off;
-}
-EOF
-            fi
+            # 证书协议：完整模式（80重定向+订阅端口双监听）
+            nginx_port="${custom_nginx_port:-2096}"
+            generate_nginx_config "$nginx_conf_file" "$domain" "$nginx_port" "full" "$fb_port" "$web_dir"
         else
-            # Reality协议：单端口配置
-            cat > "$nginx_conf_file" << EOF
-server {
-    listen $nginx_listen;  # $nginx_comment
-    server_name $domain;
-    
-    root $web_dir;
-    index index.html;
-    
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-    
-    # 订阅文件目录 - v2ray 映射到 base64
-    location ~ ^/sub/([a-f0-9-]+)/v2ray\$ {
-        alias $CFG/subscription/\$1/base64;
-        default_type text/plain;
-        add_header Content-Type "text/plain; charset=utf-8";
-    }
-    
-    # 订阅文件目录 - clash
-    location ~ ^/sub/([a-f0-9-]+)/clash\$ {
-        alias $CFG/subscription/\$1/clash.yaml;
-        default_type text/yaml;
-    }
-    
-    # 订阅文件目录 - surge
-    location ~ ^/sub/([a-f0-9-]+)/surge\$ {
-        alias $CFG/subscription/\$1/surge.conf;
-        default_type text/plain;
-    }
-    
-    # 订阅文件目录 - singbox
-    location ~ ^/sub/([a-f0-9-]+)/singbox\$ {
-        alias $CFG/subscription/\$1/singbox.json;
-        default_type application/json;
-    }
-    
-    # 订阅文件目录 - 通用
-    location /sub/ {
-        alias $CFG/subscription/;
-        autoindex off;
-        default_type text/plain;
-    }
-    
-    # 隐藏Nginx版本
-    server_tokens off;
-}
-EOF
+            # 默认模式
+            nginx_port="${custom_nginx_port:-2096}"
+            generate_nginx_config "$nginx_conf_file" "$domain" "$nginx_port" "full" "$fb_port" "$web_dir"
         fi
         
         # 如果使用 sites-available 模式，创建软链接（使用域名格式）
@@ -12761,11 +13870,6 @@ $([[ " ${country_list[*]} " == *" NL "* ]] && echo "      - NL")
       - 手动切换
       - 自动选择
 
-  - name: 国内媒体
-    type: select
-    proxies:
-      - DIRECT
-
   - name: 本地直连
     type: select
     proxies:
@@ -13268,30 +14372,38 @@ generate_sub_files() {
     _ok "订阅文件已生成"
 }
 
-# 配置 Nginx 订阅服务 (无重定向架构)
-# 配置 Nginx 订阅服务 (恢复旧版稳定模式)
-# 配置 Nginx 订阅服务
+# 配置 Nginx 订阅服务 (统一格式：80重定向+订阅端口双监听)
 setup_nginx_sub() {
     local sub_uuid=$(get_sub_uuid)
-    local sub_port="${1:-8443}" domain="${2:-}" use_https="${3:-true}"
+    local sub_port="${1:-2096}" domain="${2:-}" use_https="${3:-true}"
 
     generate_sub_files
-    local sub_dir="$CFG/subscription/$sub_uuid"
-    local fake_conf="/etc/nginx/conf.d/vless-fake.conf"
+    local web_dir="/var/www/html"
 
-    # 检查现有配置：已存在且路由正确则直接复用
-    if [[ -f "$fake_conf" ]] &&
-       grep -q "listen.*$sub_port" "$fake_conf" 2>/dev/null &&
-       grep -q "location.*sub.*alias.*subscription" "$fake_conf" 2>/dev/null; then
-        _ok "Nginx 已配置订阅服务: 端口 $sub_port"
-        return 0
+    # 确定nginx配置路径和文件名
+    local conf_name="${domain:-vless-server}"
+    [[ "$conf_name" == "localhost" || -z "$conf_name" ]] && conf_name="vless-server"
+    
+    local nginx_conf_file=""
+    local use_sites_available=false
+    
+    if [[ -d "/etc/nginx/sites-available" ]]; then
+        nginx_conf_file="/etc/nginx/sites-available/$conf_name"
+        use_sites_available=true
+    elif [[ -d "/etc/nginx/conf.d" ]]; then
+        nginx_conf_file="/etc/nginx/conf.d/$conf_name.conf"
+    elif [[ -d "/etc/nginx/http.d" ]]; then
+        nginx_conf_file="/etc/nginx/http.d/$conf_name.conf"
+    else
+        mkdir -p /etc/nginx/conf.d
+        nginx_conf_file="/etc/nginx/conf.d/$conf_name.conf"
     fi
 
-    local cert_file="$CFG/certs/server.crt" key_file="$CFG/certs/server.key"
-    local nginx_conf="/etc/nginx/conf.d/vless-sub.conf"
-    rm -f "$nginx_conf" 2>/dev/null
-    mkdir -p /etc/nginx/conf.d
+    # 清理旧配置
+    cleanup_nginx_configs "$conf_name"
 
+    # 证书检查
+    local cert_file="$CFG/certs/server.crt" key_file="$CFG/certs/server.key"
     if [[ "$use_https" == "true" && ( ! -f "$cert_file" || ! -f "$key_file" ) ]]; then
         _warn "证书不存在，生成自签名证书..."
         gen_self_cert "${domain:-localhost}"
@@ -13301,71 +14413,24 @@ setup_nginx_sub() {
         use_https="false"
     fi
 
-    local ssl_listen="" ssl_block=""
-    if [[ "$use_https" == "true" ]]; then
-        ssl_listen=" ssl http2"
-        ssl_block=$(cat <<EOF
-    ssl_certificate $cert_file;
-    ssl_certificate_key $key_file;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-EOF
-)
-    fi
+    # 选择模式并生成配置
+    local mode="full"
+    [[ "$use_https" != "true" ]] && mode="simple"
+    
+    # 获取回落端口 (从主协议配置中读取，默认8443)
+    local fb_port="${4:-8443}"
+    
+    generate_nginx_config "$nginx_conf_file" "${domain:-_}" "$sub_port" "$mode" "$fb_port" "$web_dir"
 
-    cat > "$nginx_conf" << EOF
-server {
-    listen $sub_port$ssl_listen;
-    listen [::]:$sub_port$ssl_listen;
-    server_name ${domain:-_};
-$ssl_block
-    # 订阅路径 (alias 直指文件，避免 try_files 误判)
-    location /sub/$sub_uuid/ {
-        alias $sub_dir/;
-        default_type text/plain;
-        add_header Content-Type 'text/plain; charset=utf-8';
-    }
-
-    location /sub/$sub_uuid/clash {
-        alias $sub_dir/clash.yaml;
-        default_type text/yaml;
-        add_header Content-Disposition 'attachment; filename="clash.yaml"';
-    }
-
-    location /sub/$sub_uuid/surge {
-        alias $sub_dir/surge.conf;
-        default_type text/plain;
-        add_header Content-Disposition 'attachment; filename="surge.conf"';
-    }
-
-    location /sub/$sub_uuid/v2ray {
-        alias $sub_dir/base64;
-        default_type text/plain;
-    }
-
-    # 伪装网页
-    root /var/www/html;
-    index index.html;
-
-    location / { try_files \$uri \$uri/ =404; }
-
-    # 隐藏 Nginx 版本
-    server_tokens off;
-}
-EOF
-
-    if nginx -t >/dev/null 2>&1; then
-        if [[ "$DISTRO" == "alpine" ]]; then
-            rc-service nginx restart 2>/dev/null || nginx -s reload
-        else
-            systemctl reload nginx 2>/dev/null || nginx -s reload
-        fi
+    # 应用配置
+    local link_name=""
+    [[ "$use_sites_available" == "true" ]] && link_name="$conf_name"
+    
+    if apply_nginx_config "$nginx_conf_file" "$link_name"; then
         _ok "Nginx 配置完成"
         return 0
     fi
 
-    _err "Nginx 配置失败，请检查冲突"
-    nginx -t
     return 1
 }
 
@@ -13378,26 +14443,32 @@ show_sub_links() {
     local sub_uuid="" sub_port="" sub_domain="" sub_https=""
     source "$CFG/sub.info"
     local ipv4=$(get_ipv4)
-    local protocol="http"
-    [[ "$sub_https" == "true" ]] && protocol="https"
     
     # 计算基础 URL (显式保留所有端口)
     local port_suffix=":${sub_port}"
-    local base_url="${protocol}://${sub_domain:-$ipv4}${port_suffix}/sub/${sub_uuid}"
+    local http_base="http://${sub_domain:-$ipv4}${port_suffix}/sub/${sub_uuid}"
+    local https_base="https://${sub_domain:-$ipv4}${port_suffix}/sub/${sub_uuid}"
     
     _header
     echo -e "  ${W}订阅服务地址${NC}"
     _line
     
     echo -e "  ${C}当前订阅端口: ${sub_port}${NC}"
-    echo -e "  ${Y}根 URL:${NC} ${G}${protocol}://${sub_domain:-$ipv4}:${sub_port}/sub/${sub_uuid}/...${NC}"
+    echo -e "  ${C}支持协议: HTTP / HTTPS${NC}"
     
     echo ""
-    echo -e "  ${Y}Clash/V2Ray/Sing-box 通用入口:${NC}"
-    echo -e "  - Clash:   ${G}${base_url}/clash${NC}"
-    echo -e "  - Singbox: ${G}${base_url}/singbox${NC}"
-    echo -e "  - V2Ray:   ${G}${base_url}/v2ray${NC}"
-    echo -e "  - Surge:   ${G}${base_url}/surge${NC}"
+    echo -e "  ${Y}HTTPS 订阅链接 (推荐):${NC}"
+    echo -e "  - Clash:   ${G}${https_base}/clash${NC}"
+    echo -e "  - Singbox: ${G}${https_base}/singbox${NC}"
+    echo -e "  - V2Ray:   ${G}${https_base}/v2ray${NC}"
+    echo -e "  - Surge:   ${G}${https_base}/surge${NC}"
+    
+    echo ""
+    echo -e "  ${Y}HTTP 订阅链接:${NC}"
+    echo -e "  - Clash:   ${D}${http_base}/clash${NC}"
+    echo -e "  - Singbox: ${D}${http_base}/singbox${NC}"
+    echo -e "  - V2Ray:   ${D}${http_base}/v2ray${NC}"
+    echo -e "  - Surge:   ${D}${http_base}/surge${NC}"
     _line
     
     # 额外提示
@@ -13452,17 +14523,27 @@ manage_subscription() {
                 3) manage_external_nodes ;;
                 4) 
                     read -rp "  请输入新端口: " new_sub_port
-                    if [[ "$new_sub_port" =~ ^[0-9]+$ ]]; then
-                        if setup_nginx_sub "$new_sub_port" "$sub_domain" "$sub_https"; then
+                    if [[ "$new_sub_port" =~ ^[0-9]+$ ]] && [[ $new_sub_port -ge 1 ]] && [[ $new_sub_port -le 65535 ]]; then
+                        # 联动更新 Nginx：优先使用全面的 create_fake_website
+                        # 使用域名作为配置文件名，若无域名则使用脚本名vless-server
+                        local conf_name="${sub_domain:-vless-server}"
+                        [[ "$conf_name" == "localhost" || -z "$conf_name" ]] && conf_name="vless-server"
+                        if create_fake_website "$conf_name" "$conf_name" "$new_sub_port"; then
                             sub_port="$new_sub_port"
-                            # 更新 sub.info
+                            # 更新 sub.info (虽然 create_fake_website 内部也会更新，这里手动确保变量一致)
                             cat > "$CFG/sub.info" << EOF
 sub_uuid=$sub_uuid
 sub_port=$sub_port
 sub_domain=$sub_domain
 sub_https=$sub_https
 EOF
-                            _ok "订阅端口已更新为: $sub_port"
+                            _ok "订阅端口已成功更新并刷新 Nginx"
+                        else
+                            # 如果全量模式失败，尝试基础模式
+                            if setup_nginx_sub "$new_sub_port" "$sub_domain" "$sub_https"; then
+                                sub_port="$new_sub_port"
+                                _ok "订阅端口已通过基础模式更新"
+                            fi
                         fi
                     else
                         _err "无效端口"
@@ -13470,7 +14551,13 @@ EOF
                     _pause
                     ;;
                 5) manage_fb_port ;;
-                6) create_fake_website "config-only" "config-only"; _pause ;;
+                6) 
+                    # 使用域名作为配置文件名，若无域名则使用脚本名vless-server
+                    local refresh_name="${sub_domain:-vless-server}"
+                    [[ "$refresh_name" == "localhost" || -z "$refresh_name" ]] && refresh_name="vless-server"
+                    create_fake_website "$refresh_name" "$refresh_name"
+                    _pause 
+                    ;;
                 7) 
                     # 彻底清理所有可能的 Nginx 配置路径
                     if [[ -f "$CFG/sub.info" ]]; then
@@ -13493,7 +14580,7 @@ EOF
             esac
         else
             case $choice in
-                1) create_fake_website "" "config-only"; _pause ;;
+                1) create_fake_website "" "vless-server"; _pause ;;
                 2) manage_external_nodes ;;
                 0) return ;;
             esac
@@ -13527,8 +14614,17 @@ manage_fb_port() {
         
         echo "$new_port" > "$CFG/fallback_port"
         _ok "回落端口已更新为: $new_port"
-        _info "正在重新刷新 Nginx 配置以应用新端口..."
-        create_fake_website "config-only" "config-only"
+        
+        # 联动更新 Nginx：读取当前订阅端口并透传，防止被重置为默认值
+        local cur_sub_port="2086"
+        [[ -f "$CFG/sub.info" ]] && {
+            local sub_uuid="" sub_port="" sub_domain="" sub_https=""
+            source "$CFG/sub.info"
+            cur_sub_port="$sub_port"
+        }
+        
+        _info "正在重新刷新 Nginx 配置以应用新端口 (订阅端口: $cur_sub_port)..."
+        create_fake_website "config-only" "config-only" "$cur_sub_port"
         _pause
     else
         _err "无效端口"
@@ -13804,8 +14900,812 @@ show_service_logs() {
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
+#  用户管理菜单
+#═══════════════════════════════════════════════════════════════════════════════
+
+# 选择协议 (用于用户管理)
+_select_protocol_for_users() {
+    local protocols=$(db_get_all_protocols)
+    [[ -z "$protocols" ]] && { _err "没有已安装的协议"; return 1; }
+    
+    echo ""
+    _line
+    echo -e "  ${W}选择协议${NC}"
+    _line
+    
+    local i=1
+    local proto_array=()
+    while IFS= read -r proto; do
+        [[ -z "$proto" ]] && continue
+        local core="xray"
+        db_exists "singbox" "$proto" && core="singbox"
+        local user_count=$(db_count_users "$core" "$proto")
+        local proto_name=$(get_protocol_name "$proto")
+        _item "$i" "$proto_name ${D}($user_count 用户)${NC}"
+        proto_array+=("$core:$proto")
+        ((i++))
+    done <<< "$protocols"
+    
+    _item "0" "返回"
+    _line
+    
+    local max=$((i-1))
+    while true; do
+        read -rp "  请选择 [0-$max]: " choice
+        [[ "$choice" == "0" ]] && return 1
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$max" ]]; then
+            SELECTED_CORE="${proto_array[$((choice-1))]%%:*}"
+            SELECTED_PROTO="${proto_array[$((choice-1))]#*:}"
+            return 0
+        fi
+        _err "无效选择"
+    done
+}
+
+# 显示用户列表
+_show_users_list() {
+    local core="$1" proto="$2"
+    local proto_name=$(get_protocol_name "$proto")
+    
+    echo ""
+    _dline
+    echo -e "  ${C}$proto_name 用户列表${NC}"
+    _dline
+    
+    local stats=$(db_get_users_stats "$core" "$proto")
+    if [[ -z "$stats" ]]; then
+        echo -e "  ${D}暂无用户${NC}"
+        _line
+        return
+    fi
+    
+    printf "  ${W}%-10s %-9s %-10s %-8s %-4s %-10s${NC}\n" "用户名" "已用" "配额" "使用率" "状态" "路由"
+    _line
+    
+    while IFS='|' read -r name uuid used quota enabled port routing; do
+        [[ -z "$name" ]] && continue
+        
+        local used_fmt=$(format_bytes "$used")
+        local quota_fmt="无限"
+        local percent="-"
+        local status_icon="${G}●${NC}"
+        local routing_fmt=$(_format_user_routing "$routing")
+        
+        if [[ "$quota" -gt 0 ]]; then
+            quota_fmt=$(format_bytes "$quota")
+            percent=$(awk -v u="$used" -v q="$quota" 'BEGIN {printf "%.0f%%", (u/q)*100}')
+            local pct_num=$(awk -v u="$used" -v q="$quota" 'BEGIN {printf "%.0f", (u/q)*100}')
+            if [[ "$pct_num" -ge 100 ]]; then
+                percent="${R}${percent}${NC}"
+            elif [[ "$pct_num" -ge 80 ]]; then
+                percent="${Y}${percent}${NC}"
+            fi
+        fi
+        
+        [[ "$enabled" != "true" ]] && status_icon="${R}○${NC}"
+        
+        printf "  %-10s %-9s %-10s %-8s %b  %-10s\n" "$name" "$used_fmt" "$quota_fmt" "$percent" "$status_icon" "$routing_fmt"
+    done <<< "$stats"
+    
+    _line
+}
+
+# 添加用户
+_add_user() {
+    local core="$1" proto="$2"
+    local proto_name=$(get_protocol_name "$proto")
+    
+    echo ""
+    _line
+    echo -e "  ${W}添加用户 - $proto_name${NC}"
+    _line
+    
+    read -rp "  用户名 (字母数字): " username
+    if [[ -z "$username" ]] || [[ ! "$username" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        _err "用户名无效 (仅支持字母、数字、下划线、连字符)"
+        return
+    fi
+    
+    # 检查用户是否已存在
+    if db_get_user "$core" "$proto" "$username" &>/dev/null; then
+        _err "用户 $username 已存在"
+        return
+    fi
+    
+    # 生成 UUID/密码
+    local credential=""
+    case "$proto" in
+        vless*|vmess*) credential=$(cat /proc/sys/kernel/random/uuid) ;;
+        trojan|hy2|tuic) credential=$(openssl rand -base64 16 | tr -d '/+=') ;;
+        ss2022) credential=$(openssl rand -base64 32) ;;
+        socks) 
+            read -rp "  密码: " credential
+            [[ -z "$credential" ]] && credential=$(openssl rand -base64 12 | tr -d '/+=')
+            ;;
+        *) credential=$(cat /proc/sys/kernel/random/uuid) ;;
+    esac
+    
+    # 配额设置
+    read -rp "  流量配额 (GB, 0=无限) [0]: " quota_gb
+    quota_gb=${quota_gb:-0}
+    if [[ ! "$quota_gb" =~ ^[0-9]+$ ]]; then
+        _err "配额必须是数字"
+        return
+    fi
+    
+    # 添加用户
+    if db_add_user "$core" "$proto" "$username" "$credential" "$quota_gb"; then
+        _ok "用户 $username 添加成功"
+        echo -e "  ${D}UUID/密码: $credential${NC}"
+    else
+        _err "添加失败"
+    fi
+}
+
+# 删除用户
+_delete_user() {
+    local core="$1" proto="$2"
+    local proto_name=$(get_protocol_name "$proto")
+    
+    local users=$(db_list_users "$core" "$proto")
+    [[ -z "$users" ]] && { _err "没有用户"; return; }
+    
+    echo ""
+    _line
+    echo -e "  ${W}删除用户 - $proto_name${NC}"
+    _line
+    
+    local i=1
+    local user_array=()
+    while IFS= read -r user; do
+        [[ -z "$user" ]] && continue
+        _item "$i" "$user"
+        user_array+=("$user")
+        ((i++))
+    done <<< "$users"
+    
+    _item "0" "返回"
+    _line
+    
+    local max=$((i-1))
+    while true; do
+        read -rp "  选择删除 [0-$max]: " choice
+        [[ "$choice" == "0" ]] && return
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$max" ]]; then
+            local name="${user_array[$((choice-1))]}"
+            
+            read -rp "  确认删除用户 $name? [y/N]: " confirm
+            [[ ! "$confirm" =~ ^[yY]$ ]] && return
+            
+            if db_del_user "$core" "$proto" "$name"; then
+                _ok "用户 $name 已删除"
+            else
+                _err "删除失败"
+            fi
+            return
+        fi
+        _err "无效选择"
+    done
+}
+
+# 设置用户配额
+_set_user_quota() {
+    local core="$1" proto="$2"
+    local proto_name=$(get_protocol_name "$proto")
+    
+    local users=$(db_list_users "$core" "$proto")
+    [[ -z "$users" ]] && { _err "没有用户"; return; }
+    
+    echo ""
+    _line
+    echo -e "  ${W}设置配额 - $proto_name${NC}"
+    _line
+    
+    local i=1
+    local user_array=()
+    while IFS= read -r user; do
+        [[ -z "$user" ]] && continue
+        local quota=$(db_get_user_field "$core" "$proto" "$user" "quota")
+        local quota_fmt="无限"
+        [[ "$quota" -gt 0 ]] && quota_fmt=$(format_bytes "$quota")
+        _item "$i" "$user ${D}(当前: $quota_fmt)${NC}"
+        user_array+=("$user")
+        ((i++))
+    done <<< "$users"
+    
+    _item "0" "返回"
+    _line
+    
+    local max=$((i-1))
+    while true; do
+        read -rp "  选择用户 [0-$max]: " choice
+        [[ "$choice" == "0" ]] && return
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$max" ]]; then
+            local name="${user_array[$((choice-1))]}"
+            
+            read -rp "  新配额 (GB, 0=无限): " new_quota
+            if [[ ! "$new_quota" =~ ^[0-9]+$ ]]; then
+                _err "配额必须是数字"
+                return
+            fi
+            
+            if db_set_user_quota "$core" "$proto" "$name" "$new_quota"; then
+                _ok "用户 $name 配额已设置为 ${new_quota}GB"
+            else
+                _err "设置失败"
+            fi
+            return
+        fi
+        _err "无效选择"
+    done
+}
+
+# 重置用户流量
+_reset_user_traffic() {
+    local core="$1" proto="$2"
+    local proto_name=$(get_protocol_name "$proto")
+    
+    local users=$(db_list_users "$core" "$proto")
+    [[ -z "$users" ]] && { _err "没有用户"; return; }
+    
+    echo ""
+    _line
+    echo -e "  ${W}重置流量 - $proto_name${NC}"
+    _line
+    
+    _item "a" "重置所有用户"
+    
+    local i=1
+    local user_array=()
+    while IFS= read -r user; do
+        [[ -z "$user" ]] && continue
+        local used=$(db_get_user_field "$core" "$proto" "$user" "used")
+        local used_fmt=$(format_bytes "$used")
+        _item "$i" "$user ${D}(已用: $used_fmt)${NC}"
+        user_array+=("$user")
+        ((i++))
+    done <<< "$users"
+    
+    _item "0" "返回"
+    _line
+    
+    local max=$((i-1))
+    while true; do
+        read -rp "  选择 [0-$max/a]: " choice
+        [[ "$choice" == "0" ]] && return
+        
+        if [[ "$choice" == "a" || "$choice" == "A" ]]; then
+            read -rp "  确认重置所有用户流量? [y/N]: " confirm
+            [[ ! "$confirm" =~ ^[yY]$ ]] && return
+            
+            for user in $users; do
+                db_reset_user_traffic "$core" "$proto" "$user"
+            done
+            _ok "所有用户流量已重置"
+            return
+        fi
+        
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$max" ]]; then
+            local name="${user_array[$((choice-1))]}"
+            
+            read -rp "  确认重置用户 $name 的流量? [y/N]: " confirm
+            [[ ! "$confirm" =~ ^[yY]$ ]] && return
+            
+            if db_reset_user_traffic "$core" "$proto" "$name"; then
+                _ok "用户 $name 流量已重置"
+            else
+                _err "重置失败"
+            fi
+            return
+        fi
+        _err "无效选择"
+    done
+}
+
+# 启用/禁用用户
+_toggle_user() {
+    local core="$1" proto="$2"
+    local proto_name=$(get_protocol_name "$proto")
+    
+    local users=$(db_list_users "$core" "$proto")
+    [[ -z "$users" ]] && { _err "没有用户"; return; }
+    
+    echo ""
+    _line
+    echo -e "  ${W}启用/禁用用户 - $proto_name${NC}"
+    _line
+    
+    local i=1
+    local user_array=()
+    while IFS= read -r user; do
+        [[ -z "$user" ]] && continue
+        local enabled=$(db_get_user_field "$core" "$proto" "$user" "enabled")
+        local status="${G}● 启用${NC}"
+        [[ "$enabled" != "true" ]] && status="${R}○ 禁用${NC}"
+        _item "$i" "$user $status"
+        user_array+=("$user")
+        ((i++))
+    done <<< "$users"
+    
+    _item "0" "返回"
+    _line
+    
+    local max=$((i-1))
+    while true; do
+        read -rp "  选择用户 [0-$max]: " choice
+        [[ "$choice" == "0" ]] && return
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$max" ]]; then
+            local name="${user_array[$((choice-1))]}"
+            local enabled=$(db_get_user_field "$core" "$proto" "$name" "enabled")
+            
+            local new_state="true"
+            local action="启用"
+            if [[ "$enabled" == "true" ]]; then
+                new_state="false"
+                action="禁用"
+            fi
+            
+            if db_set_user_enabled "$core" "$proto" "$name" "$new_state"; then
+                _ok "用户 $name 已${action}"
+            else
+                _err "操作失败"
+            fi
+            return
+        fi
+        _err "无效选择"
+    done
+}
+
+# 检测当前运行的核心类型
+_detect_current_core() {
+    if _pgrep xray &>/dev/null; then
+        echo "xray"
+        return
+    fi
+    if _pgrep sing-box &>/dev/null || _pgrep singbox &>/dev/null; then
+        echo "singbox"
+        return
+    fi
+    if _pgrep hysteria &>/dev/null || _pgrep naive &>/dev/null || _pgrep tuic &>/dev/null; then
+        echo "standalone"
+        return
+    fi
+    if [[ -f "$XRAY_CONFIG" ]]; then
+        echo "xray"
+        return
+    fi
+    if [[ -f "$SINGBOX_CONFIG" ]]; then
+        echo "singbox"
+        return
+    fi
+    echo "none"
+}
+
+# 显示实时流量统计
+_show_realtime_traffic() {
+    _header
+    echo -e "  ${W}实时流量统计${NC}"
+    _dline
+    
+    local has_xray=false
+    local has_singbox=false
+    
+    if _pgrep xray &>/dev/null; then
+        has_xray=true
+    fi
+    if _pgrep sing-box &>/dev/null; then
+        has_singbox=true
+    fi
+    
+    if [[ "$has_xray" == "false" && "$has_singbox" == "false" ]]; then
+        echo ""
+        _warn "未检测到运行中的代理核心"
+        echo ""
+        echo -e "  ${D}请先安装并启动 Xray 或 Sing-box 核心的协议。${NC}"
+        return
+    fi
+    
+    echo ""
+    printf "  ${W}%-12s %-12s %-12s %-12s %-12s${NC}\n" "协议" "用户" "上行" "下行" "总计"
+    _line
+    
+    local stats=$(get_all_traffic_stats)
+    if [[ -z "$stats" ]]; then
+        echo -e "  ${D}暂无流量数据${NC}"
+    else
+        while IFS='|' read -r proto user uplink downlink total; do
+            [[ -z "$proto" ]] && continue
+            local proto_name=$(get_protocol_name "$proto")
+            local up_fmt=$(format_bytes "$uplink")
+            local down_fmt=$(format_bytes "$downlink")
+            local total_fmt=$(format_bytes "$total")
+            printf "  %-12s %-12s %-12s %-12s %-12s\n" "$proto_name" "$user" "$up_fmt" "$down_fmt" "$total_fmt"
+        done <<< "$stats"
+    fi
+    
+    _line
+    echo ""
+    echo -e "  ${D}提示: 此为 Xray 启动后的累计流量，同步后会重置${NC}"
+    
+    if [[ "$has_singbox" == "true" ]]; then
+        echo -e "  ${D}注意: Sing-box (hy2/tuic) 暂不支持流量统计${NC}"
+    fi
+}
+
+# 立即同步流量数据
+_sync_traffic_now() {
+    _header
+    echo -e "  ${W}同步流量数据${NC}"
+    _dline
+    
+    local has_xray=false
+    local has_singbox=false
+    
+    if _pgrep xray &>/dev/null; then
+        has_xray=true
+    fi
+    if _pgrep sing-box &>/dev/null; then
+        has_singbox=true
+    fi
+    
+    if [[ "$has_xray" == "false" && "$has_singbox" == "false" ]]; then
+        echo ""
+        _warn "未检测到运行中的代理核心"
+        return
+    fi
+    
+    _info "正在同步流量数据..."
+    
+    if sync_all_user_traffic "true"; then
+        _ok "流量数据已同步到数据库"
+        echo ""
+        
+        echo -e "  ${W}用户流量统计:${NC}"
+        _line
+        
+        if [[ "$has_xray" == "true" ]]; then
+            for proto in $(db_list_protocols "xray"); do
+                local proto_name=$(get_protocol_name "$proto")
+                local users=$(db_get_users_stats "xray" "$proto")
+                [[ -z "$users" ]] && continue
+                
+                echo -e "  ${C}$proto_name${NC}"
+                while IFS='|' read -r name uuid used quota enabled port routing; do
+                    [[ -z "$name" ]] && continue
+                    local used_fmt=$(format_bytes "$used")
+                    local quota_fmt="无限制"
+                    local status="${G}●${NC}"
+                    
+                    if [[ "$quota" -gt 0 ]]; then
+                        quota_fmt=$(format_bytes "$quota")
+                        local percent=$((used * 100 / quota))
+                        if [[ "$percent" -ge 100 ]]; then
+                            status="${R}✗${NC}"
+                        elif [[ "$percent" -ge 80 ]]; then
+                            status="${Y}⚠${NC}"
+                        fi
+                    fi
+                    
+                    [[ "$enabled" != "true" ]] && status="${R}○${NC}"
+                    
+                    echo -e "    $status $name: $used_fmt / $quota_fmt"
+                done <<< "$users"
+            done
+        fi
+        
+        if [[ "$has_singbox" == "true" ]]; then
+            echo ""
+            echo -e "  ${D}注意: Sing-box (hy2/tuic) 暂不支持流量统计${NC}"
+        fi
+        
+        _line
+    else
+        _err "同步失败"
+    fi
+}
+
+# 流量统计设置
+_configure_traffic_stats() {
+    while true; do
+        _header
+        echo -e "  ${W}流量统计设置${NC}"
+        _dline
+        
+        local cron_status="${R}○ 未启用${NC}"
+        local current_interval=$(get_traffic_interval)
+        if crontab -l 2>/dev/null | grep -q "sync-traffic"; then
+            cron_status="${G}● 已启用 (每${current_interval}分钟)${NC}"
+        fi
+        
+        local notify_percent=$(tg_get_config "notify_quota_percent")
+        notify_percent=${notify_percent:-80}
+        
+        echo -e "  自动同步: $cron_status"
+        echo -e "  检测间隔: ${G}${current_interval} 分钟${NC}"
+        echo -e "  告警阈值: ${G}${notify_percent}%${NC}"
+        _line
+        
+        _item "1" "启用自动同步"
+        _item "2" "禁用自动同步"
+        _item "3" "设置检测间隔"
+        _item "4" "设置告警阈值"
+        _item "0" "返回"
+        _line
+        
+        read -rp "  请选择: " choice
+        case $choice in
+            1)
+                setup_traffic_cron "$current_interval"
+                _pause
+                ;;
+            2)
+                remove_traffic_cron
+                _pause
+                ;;
+            3)
+                echo ""
+                echo -e "  ${D}设置流量检测间隔 (分钟)${NC}"
+                read -rp "  检测间隔 (1-60) [$current_interval]: " new_interval
+                new_interval="${new_interval:-$current_interval}"
+                if [[ "$new_interval" =~ ^[0-9]+$ ]] && [[ "$new_interval" -ge 1 ]] && [[ "$new_interval" -le 60 ]]; then
+                    if crontab -l 2>/dev/null | grep -q "sync-traffic"; then
+                        setup_traffic_cron "$new_interval"
+                    else
+                        set_traffic_interval "$new_interval"
+                        _ok "检测间隔已设置为 ${new_interval} 分钟"
+                    fi
+                else
+                    _err "无效的间隔"
+                fi
+                _pause
+                ;;
+            4)
+                echo ""
+                read -rp "  告警阈值 (1-99) [$notify_percent]: " new_percent
+                new_percent="${new_percent:-$notify_percent}"
+                if [[ "$new_percent" =~ ^[0-9]+$ ]] && [[ "$new_percent" -ge 1 ]] && [[ "$new_percent" -le 99 ]]; then
+                    tg_set_config "notify_quota_percent" "$new_percent"
+                    _ok "告警阈值已设置为 ${new_percent}%"
+                else
+                    _err "无效的阈值"
+                fi
+                _pause
+                ;;
+            0) return ;;
+            *) _err "无效选择" ;;
+        esac
+    done
+}
+
+# TG 通知配置
+_configure_tg_notify() {
+    while true; do
+        _header
+        echo -e "  ${W}Telegram 通知配置${NC}"
+        _dline
+        
+        local enabled=$(tg_get_config "enabled")
+        local bot_token=$(tg_get_config "bot_token")
+        local chat_id=$(tg_get_config "chat_id")
+        local notify_percent=$(tg_get_config "notify_quota_percent")
+        local notify_daily=$(tg_get_config "notify_daily")
+        
+        local status="${R}○ 未启用${NC}"
+        [[ "$enabled" == "true" ]] && status="${G}● 已启用${NC}"
+        
+        echo -e "  状态: $status"
+        if [[ -n "$bot_token" ]]; then
+            echo -e "  Bot Token: ${D}${bot_token:0:10}...${NC}"
+        fi
+        if [[ -n "$chat_id" ]]; then
+            echo -e "  Chat ID: ${D}$chat_id${NC}"
+        fi
+        echo -e "  告警阈值: ${G}${notify_percent:-80}%${NC}"
+        
+        local daily_status="${R}关闭${NC}"
+        [[ "$notify_daily" == "true" ]] && daily_status="${G}开启${NC}"
+        echo -e "  每日报告: $daily_status"
+        _line
+        
+        _item "1" "设置 Bot Token"
+        _item "2" "设置 Chat ID"
+        _item "3" "启用/禁用通知"
+        _item "4" "测试发送"
+        _item "5" "每日报告设置"
+        _item "0" "返回"
+        _line
+        
+        read -rp "  请选择: " choice
+        case $choice in
+            1)
+                echo ""
+                read -rp "  Bot Token: " new_token
+                if [[ -n "$new_token" ]]; then
+                    tg_set_config "bot_token" "$new_token"
+                    _ok "Bot Token 已保存"
+                fi
+                _pause
+                ;;
+            2)
+                echo ""
+                read -rp "  Chat ID: " new_chat_id
+                if [[ -n "$new_chat_id" ]]; then
+                    tg_set_config "chat_id" "$new_chat_id"
+                    _ok "Chat ID 已保存"
+                fi
+                _pause
+                ;;
+            3)
+                if [[ "$enabled" == "true" ]]; then
+                    tg_set_config "enabled" "false"
+                    _ok "TG 通知已禁用"
+                else
+                    if [[ -z "$bot_token" || -z "$chat_id" ]]; then
+                        _err "请先设置 Bot Token 和 Chat ID"
+                    else
+                        tg_set_config "enabled" "true"
+                        _ok "TG 通知已启用"
+                    fi
+                fi
+                _pause
+                ;;
+            4)
+                if [[ -z "$bot_token" || -z "$chat_id" ]]; then
+                    _err "请先设置 Bot Token 和 Chat ID"
+                else
+                    _info "发送测试消息..."
+                    local old_enabled=$(tg_get_config "enabled")
+                    tg_set_config "enabled" "true"
+                    if tg_send_message "🔔 测试消息 - VLESS 脚本通知测试"; then
+                        _ok "消息发送成功"
+                    else
+                        _err "消息发送失败"
+                    fi
+                    tg_set_config "enabled" "$old_enabled"
+                fi
+                _pause
+                ;;
+            5)
+                echo ""
+                if [[ "$notify_daily" == "true" ]]; then
+                    read -rp "  关闭每日报告? [y/N]: " confirm
+                    if [[ "$confirm" =~ ^[yY]$ ]]; then
+                        tg_set_config "notify_daily" "false"
+                        _ok "每日报告已关闭"
+                    fi
+                else
+                    local report_hour=$(tg_get_config "daily_report_hour")
+                    report_hour=${report_hour:-9}
+                    echo -e "  ${D}设置每日报告发送时间${NC}"
+                    read -rp "  发送时间 (HH:MM) [$report_hour:00]: " new_time
+                    if [[ -z "$new_time" ]]; then
+                        new_time="$report_hour:00"
+                    fi
+                    if [[ "$new_time" =~ ^([0-9]{1,2}):([0-9]{1,2})$ ]]; then
+                        local new_hour="${BASH_REMATCH[1]}"
+                        local new_minute="${BASH_REMATCH[2]}"
+                        new_hour=$((10#$new_hour))
+                        new_minute=$((10#$new_minute))
+                        if [[ "$new_hour" -ge 0 ]] && [[ "$new_hour" -le 23 ]] && \
+                           [[ "$new_minute" -ge 0 ]] && [[ "$new_minute" -le 59 ]]; then
+                            tg_set_config "notify_daily" "true"
+                            tg_set_config "daily_report_hour" "$new_hour"
+                            tg_set_config "daily_report_minute" "$new_minute"
+                            tg_set_config "last_report_date" ""
+                            _ok "每日报告已启用，将在每天 $(printf '%02d:%02d' $new_hour $new_minute) 发送"
+                        else
+                            _err "无效的时间"
+                        fi
+                    else
+                        _err "无效的时间格式"
+                    fi
+                fi
+                _pause
+                ;;
+            0) return ;;
+            *) _err "无效选择" ;;
+        esac
+    done
+}
+
+# 用户管理主菜单
+manage_users() {
+    while true; do
+        _header
+        echo -e "  ${W}用户管理${NC}"
+        _dline
+        
+        local protocols=$(db_get_all_protocols)
+        if [[ -n "$protocols" ]]; then
+            echo -e "  ${D}已安装协议:${NC}"
+            while IFS= read -r proto; do
+                [[ -z "$proto" ]] && continue
+                local core="xray"
+                db_exists "singbox" "$proto" && core="singbox"
+                local user_count=$(db_count_users "$core" "$proto")
+                local proto_name=$(get_protocol_name "$proto")
+                echo -e "  • $proto_name: ${G}$user_count${NC} 用户"
+            done <<< "$protocols"
+        fi
+        
+        _line
+        _item "1" "查看用户列表"
+        _item "2" "添加用户"
+        _item "3" "删除用户"
+        _item "4" "设置用户配额"
+        _item "5" "重置用户流量"
+        _item "6" "启用/禁用用户"
+        _line
+        _item "7" "实时流量统计"
+        _item "8" "同步流量数据"
+        _item "9" "流量统计设置"
+        _line
+        _item "t" "TG 通知配置"
+        _item "0" "返回"
+        _line
+        
+        read -rp "  请选择: " choice
+        case $choice in
+            1)
+                if _select_protocol_for_users; then
+                    _show_users_list "$SELECTED_CORE" "$SELECTED_PROTO"
+                    _pause
+                fi
+                ;;
+            2)
+                if _select_protocol_for_users; then
+                    _add_user "$SELECTED_CORE" "$SELECTED_PROTO"
+                    _pause
+                fi
+                ;;
+            3)
+                if _select_protocol_for_users; then
+                    _delete_user "$SELECTED_CORE" "$SELECTED_PROTO"
+                    _pause
+                fi
+                ;;
+            4)
+                if _select_protocol_for_users; then
+                    _set_user_quota "$SELECTED_CORE" "$SELECTED_PROTO"
+                    _pause
+                fi
+                ;;
+            5)
+                if _select_protocol_for_users; then
+                    _reset_user_traffic "$SELECTED_CORE" "$SELECTED_PROTO"
+                    _pause
+                fi
+                ;;
+            6)
+                if _select_protocol_for_users; then
+                    _toggle_user "$SELECTED_CORE" "$SELECTED_PROTO"
+                    _pause
+                fi
+                ;;
+            7)
+                _show_realtime_traffic
+                _pause
+                ;;
+            8)
+                _sync_traffic_now
+                _pause
+                ;;
+            9)
+                _configure_traffic_stats
+                ;;
+            t|T)
+                _configure_tg_notify
+                ;;
+            0) return ;;
+            *) _err "无效选择" ;;
+        esac
+    done
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
 # 脚本更新与主入口
 #═══════════════════════════════════════════════════════════════════════════════
+
 
 do_update() {
     _header
@@ -13932,12 +15832,14 @@ main_menu() {
             _item "9" "完全卸载"
             _item "l" "查看运行日志"
             _item "a" "伪装站管理"
+            _item "m" "用户管理 (多用户/流量/TG通知)"
         else
             _item "1" "安装协议"
         fi
         _item "u" "检查更新"
         _item "0" "退出"
         _line
+
         
         read -rp "  请选择: " choice || exit 0
         
@@ -13954,6 +15856,7 @@ main_menu() {
                 9) do_uninstall ;;
                 l|L) show_logs ;;
                 a|A) manage_masquerade ;;
+                m|M) manage_users ;;
                 u|U) do_update ;;
                 0) exit 0 ;;
                 *) _err "无效选择" ;;

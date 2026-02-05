@@ -1,34 +1,32 @@
-﻿# 多协议代理一键部署脚本 v3.0.3
+﻿# 多协议代理一键部署脚本 v3.4.7
 
-一个简单易用的多协议代理部署脚本，支持 **13 种主流协议**，服务端/客户端一键安装，适用于 Alpine、Debian、Ubuntu、CentOS 等 Linux 发行版。
+一个强大且智能的多协议代理部署脚本，支持 **13 种主流协议**，具备 **Smart Fallback 端口复用 (443)**、**CDN 自动匹配**、**高级伪装网** 等前沿特性。
 
-> 🙏 **声明**：本人只是一个搬运工，脚本灵感来源于网络上的各种优秀项目，特别感谢 [mack-a/v2ray-agent](https://github.com/mack-a/v2ray-agent) 八合一脚本的启发。
+> 🙏 **声明**：本人只是一个搬运工，脚本灵感来源于网络上的各种优秀项目，特别感谢 [mack-a/v2ray-agent](https://github.com/mack-a/v2ray-agent) 的启发。
 
----
-
-## 🆕 v3.0.3 更新
-
-- 修复覆盖安装hy2协议规则iptables规则不清空问题
+# 原作者：
+##  原作者: Chil30
+##  原项目地址: https://github.com/Chil30/vless-all-in-one
 
 ---
+
 
 ## ✨ 支持协议
 
 | # | 协议 | 特点 | 推荐场景 |
 |---|------|------|----------|
-| 1 | **VLESS + Reality** | 抗封锁能力强，无需域名 | 🌟 首选推荐 |
-| 2 | **VLESS + Reality + XHTTP** | 多路复用，性能更优 | 高并发场景 |
-| 3 | **VLESS + WS + TLS** | CDN 友好，可作回落 | 被墙 IP 救活 |
-| 4 | **VMess + WS** | 回落分流/免流 | 端口复用 |
-| 5 | **VLESS-XTLS-Vision** | TLS主协议，支持回落 | ⭐ 稳定传输 |
-| 6 | **SOCKS5** | 经典代理协议 | 🔥 通用性强 |
-| 7 | **Shadowsocks 2022** | 新版加密，性能好 | SS 用户迁移 |
-| 8 | **Hysteria2** | UDP 加速，端口跳跃 | 🔥 游戏/视频 |
-| 9 | **Trojan** | TLS主协议，支持回落 | ⭐ 伪装 HTTPS |
-| 10 | **Snell v4** | Surge 专用协议 (支持 ShadowTLS 插件) | iOS/Mac 用户 |
-| 11 | **Snell v5** | Surge 5.0 新版协议 (支持 ShadowTLS 插件) | 最新 Surge |
-| 12 | **AnyTLS** | 多协议 TLS 代理 | 抗审查能力强 |
-| 13 | **TUIC v5** | QUIC 协议，低延迟 | 新兴协议 |
+| 1 | **VLESS + Reality** | 抗封锁能力强，无需域名 | 🌟 首选推荐 | ❌ |
+| 2 | **VLESS + Reality + XHTTP** | 多路复用，性能更优 | 高并发场景 | ❌ |
+| 3 | **VLESS + WS + TLS** | CDN 友好，可作回落 | 被墙 IP 救活 | ✅ |
+| 4 | **VMess + WS** | 回落分流/免流 | 端口复用 | ✅ |
+| 5 | **VLESS-XTLS-Vision** | TLS主协议，支持回落 | ⭐ 稳定传输 | ❌ |
+| 6 | **SOCKS5** | 经典代理协议 | 🔥 通用性强 | ❌ |
+| 7 | **Shadowsocks 2022** | 新版加密，性能好 | SS 用户迁移 | ❌ |
+| 8 | **Hysteria2** | UDP 加速，端口跳跃 | 🔥 游戏/视频 | ❌ |
+| 9 | **Trojan** | TLS主协议，支持回落 | ⭐ 伪装 HTTPS | ❌ |
+| 10 | **Snell v4/v5** | Surge 专用协议 | iOS/Mac 用户 | ❌ |
+| 11 | **AnyTLS** | 多协议 TLS 代理 | 抗审查能力强 | ❌ |
+| 12 | **TUIC v5** | QUIC 协议，低延迟 | 新兴协议 | ❌ |
 
 > 💡 **ShadowTLS 插件**：Snell v4、Snell v5、SS2022 安装时可选择启用 ShadowTLS (v3) 插件，实现 TLS 流量伪装，抗检测能力更强。
 
@@ -119,10 +117,17 @@ vlessc
 安装需要证书的协议 (VLESS-Vision/VLESS-WS/Trojan) 后，自动生成订阅链接：
 
 ```
-https://你的域名:8443/sub/随机UUID/clash   # Clash/Clash Verge
-https://你的域名:8443/sub/随机UUID/surge   # Surge
-https://你的域名:8443/sub/随机UUID/v2ray   # V2Ray/通用
+# HTTPS 订阅链接 (推荐)
+https://你的域名:2096/sub/随机UUID/clash   # Clash/Clash Verge
+https://你的域名:2096/sub/随机UUID/surge   # Surge
+https://你的域名:2096/sub/随机UUID/singbox # Sing-box
+https://你的域名:2096/sub/随机UUID/v2ray   # V2Ray/通用
+
+# HTTP 订阅链接 (同一端口)
+http://你的域名:2096/sub/随机UUID/clash
 ```
+
+> 💡 **同端口支持 HTTP/HTTPS 双协议**，客户端可根据需要选择。
 
 ### 订阅管理
 
@@ -132,18 +137,22 @@ vless
 # 1) 查看订阅链接
 # 2) 更新订阅内容
 # 3) 外部节点管理
-# 4) 重新配置
-# 5) 停用订阅服务
+# 4) 修改订阅端口
+# 5) 回落端口管理
+# 6) 手动刷新 Nginx 配置
+# 7) 停用订阅服务
 ```
 
 ### 订阅特性
 
 - ✅ 自动包含所有已安装协议
 - ✅ 安装/卸载协议后自动更新
-- ✅ HTTPS 加密传输
+- ✅ **HTTP/HTTPS 双协议支持**（同端口）
+- ✅ **nginx-acme 自动证书管理**
 - ✅ 伪装网页，访问根路径显示正常网站
 - ✅ 随机 UUID 路径，防止被扫描
 - ✅ 外部节点管理，多机聚合订阅
+- ✅ Xray 回落支持（本地端口监听）
 
 ---
 
@@ -459,8 +468,34 @@ MIT License
 
 ## 📝 更新日志
 
-### v3.0.3 (2025-12-28)
+### v3.4.7 (2025-02-05)
 
+- 🔧 **Nginx 配置生成重构**
+  - 统一使用 `generate_nginx_config` 函数管理所有 Nginx 配置
+  - 参考 `openlist.181028.xyz` 格式：单 server 块同时监听本地回落和公网端口
+  - 支持 **HTTP/HTTPS 双协议**同端口访问订阅
+  - 集成 **nginx-acme 自动证书管理**
+- 📡 **订阅服务优化**
+  - 同时显示 HTTP 和 HTTPS 订阅链接
+  - 新增回落端口配置支持
+  - 新增手动刷新 Nginx 配置菜单项
+- 📄 **模板文件更新**
+  - `vless-nginx.txt` 模板与 nginx-acme.sh 生成格式保持一致
+
+### v3.1.0 (2025-12-29)
+
+- 🚀 **新增 Smart Fallback (SNI 分流)**
+  - 支持多域名在 443 端口平滑复用，Xray 自动匹配多证书
+- 🎭 **新增高级伪装网下载**
+  - 从 GitHub 随机获取 30+ 种 HTML 企业模板
+- ⚙️ **新增高级设置子菜单**
+  - 集成 BBR、Geo 数据更新、WARP 一键安装、链式代理配置
+- 📱 **客户端完美适配**
+  - 新增 Shadowrocket 专用参数链接与 sing-box JSON 导出
+- 📡 **路由规则优化**
+  - 默认集成大厂域名直连与国内 IP 分流，优化性能
+
+### v3.0.3 (2025-12-28)
 - 修复覆盖安装hy2协议iptables规则不清空问题
 
 ### v3.0.2 (2025-12-28)

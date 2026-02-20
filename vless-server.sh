@@ -20,7 +20,7 @@
 
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.1.3"
+readonly VERSION="3.4.7"
 readonly AUTHOR="Skillet5091"
 readonly REPO_URL="https://github.com/Skillet5091/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -2629,7 +2629,8 @@ generate_nginx_config() {
     case "$mode" in
         full)
             # 完整模式: 80重定向 + 单server块同时监听本地回落和公网SSL
-            # 格式参考 openlist.181028.xyz (nginx-acme自动证书)
+            local cert_file="$CFG/certs/server.crt"
+            local key_file="$CFG/certs/server.key"
             cat > "$conf_file" << EOF
 # ${conf_name} Nginx 配置 (由 vless-server.sh 自动生成)
 # 域名: ${domain}
@@ -2647,21 +2648,18 @@ server {
 
 server {
     listen 127.0.0.1:${fb_port};
-    listen ${nginx_port};
-    listen [::]:${nginx_port};
-    listen ${nginx_port} ssl;
-    listen [::]:${nginx_port} ssl;
-    http2 on;
+    listen ${nginx_port} ssl http2;
+    listen [::]:${nginx_port} ssl http2;
     server_name ${domain};
     
-    # nginx-acme 自动证书管理
-    acme_certificate letsencrypt;
-    ssl_certificate \$acme_certificate;
-    ssl_certificate_key \$acme_certificate_key;
-    ssl_certificate_cache max=2;
+    # SSL 证书
+    ssl_certificate ${cert_file};
+    ssl_certificate_key ${key_file};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
     
     # 日志
-    access_log /var/log/nginx/${conf_name}-access.log main buffer=64k flush=10s;
+    access_log /var/log/nginx/${conf_name}-access.log;
     error_log /var/log/nginx/${conf_name}-error.log warn;
     
     root ${web_dir};
@@ -2847,14 +2845,17 @@ create_fake_website() {
     local custom_nginx_port="$3"  # 新增：自定义 Nginx 端口
     local web_dir="/var/www/html"
     
-    # 自动读取证书域名（如果没有传入域名参数）
-    if [[ -z "$domain" ]] && [[ -f "$CFG/cert_domain" ]]; then
-        domain=$(cat "$CFG/cert_domain")
-        _info "自动读取证书域名: $domain"
+    # 自动读取证书域名（如果没有传入有效域名参数）
+    # 排除无效的域名值（如 config-only、vless-server 等历史遗留）
+    if [[ -z "$domain" || "$domain" == "config-only" || "$domain" == "vless-server" || "$domain" == "_" ]]; then
+        if [[ -f "$CFG/cert_domain" ]]; then
+            domain=$(cat "$CFG/cert_domain")
+            _info "自动读取证书域名: $domain"
+        fi
     fi
     
-    # 如果仍然没有域名，使用默认值
-    [[ -z "$domain" ]] && domain="localhost"
+    # 如果仍然没有有效域名，使用默认值
+    [[ -z "$domain" || "$domain" == "config-only" || "$domain" == "vless-server" ]] && domain="localhost"
     
     # 根据系统确定 nginx 配置目录
     # 优先使用 sites-available 目录，与其他子域名服务保持一致
@@ -2884,6 +2885,9 @@ create_fake_website() {
     rm -f "$nginx_conf_file" 2>/dev/null
     rm -f /etc/nginx/sites-enabled/vless-fake /etc/nginx/sites-available/vless-fake 2>/dev/null
     rm -f /etc/nginx/conf.d/vless-fake.conf /etc/nginx/conf.d/vless-sub.conf 2>/dev/null
+    # 清理 config-only 残留（旧版 bug 遗留）
+    rm -f /etc/nginx/sites-enabled/config-only /etc/nginx/sites-available/config-only 2>/dev/null
+    rm -f /etc/nginx/conf.d/config-only.conf 2>/dev/null
     # 如果使用域名格式，也删除对应的旧软链接
     [[ "$use_sites_available" == "true" ]] && rm -f "/etc/nginx/sites-enabled/$domain" 2>/dev/null
     
@@ -3668,9 +3672,14 @@ install_acme_tool() {
     
     # 方法3: 直接下载脚本
     _info "尝试直接下载..."
-    mkdir -p "$HOME/.acme.sh"
+    mkdir -p "$HOME/.acme.sh" "$HOME/.acme.sh/dnsapi"
     if curl -sL -o "$HOME/.acme.sh/acme.sh" "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh" 2>/dev/null; then
         chmod +x "$HOME/.acme.sh/acme.sh"
+        # 下载常用 DNS API 插件
+        for dns_plugin in dns_cf dns_ali dns_dp; do
+            curl -sL -o "$HOME/.acme.sh/dnsapi/${dns_plugin}.sh" \
+                "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/dnsapi/${dns_plugin}.sh" 2>/dev/null
+        done
         if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
             _ok "acme.sh 安装成功 (直接下载)"
             return 0
@@ -3754,6 +3763,19 @@ _issue_cert_dns() {
     install_acme_tool || return 1
     local acme_sh="$HOME/.acme.sh/acme.sh"
     
+    # 确保 DNS API 插件存在
+    local dns_plugin_file="$HOME/.acme.sh/dnsapi/${dns_api}.sh"
+    if [[ ! -f "$dns_plugin_file" ]]; then
+        _info "下载 DNS API 插件 (${dns_api})..."
+        mkdir -p "$HOME/.acme.sh/dnsapi"
+        if ! curl -sL -o "$dns_plugin_file" \
+            "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/dnsapi/${dns_api}.sh" 2>/dev/null; then
+            _err "DNS API 插件下载失败: ${dns_api}"
+            return 1
+        fi
+        _ok "DNS API 插件已就绪"
+    fi
+    
     _info "正在通过 DNS 验证申请证书..."
     echo ""
     
@@ -3762,7 +3784,7 @@ _issue_cert_dns() {
     
     local reload_cmd="chmod 600 $cert_dir/server.key; chmod 644 $cert_dir/server.crt"
     
-    if "$acme_sh" --issue -d "$domain" --dns "$dns_api" --force 2>&1 | tee /tmp/acme_dns.log | grep -E "^\[|Verify finished|Cert success|error|Error" | sed 's/^/  /'; then
+    if "$acme_sh" --issue -d "$domain" --dns "$dns_api" --server letsencrypt --force 2>&1 | tee /tmp/acme_dns.log | grep -E "^\[|Verify finished|Cert success|error|Error" | sed 's/^/  /'; then
         echo ""
         _ok "证书申请成功，安装证书..."
         
@@ -3807,11 +3829,11 @@ _issue_cert_dns_manual() {
     echo ""
     
     # 获取 DNS 记录
-    local txt_record=$("$acme_sh" --issue -d "$domain" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please --force 2>&1 | grep -oP "TXT value: '\K[^']+")
+    local txt_record=$("$acme_sh" --issue -d "$domain" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please --server letsencrypt --force 2>&1 | grep -oP "TXT value: '\K[^']+")
     
     if [[ -z "$txt_record" ]]; then
         # 尝试另一种方式获取
-        "$acme_sh" --issue -d "$domain" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please --force 2>&1 | tee /tmp/acme_manual.log
+        "$acme_sh" --issue -d "$domain" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please --server letsencrypt --force 2>&1 | tee /tmp/acme_manual.log
         txt_record=$(grep -oP "TXT value: '\K[^']+" /tmp/acme_manual.log 2>/dev/null)
     fi
     
@@ -3838,7 +3860,7 @@ _issue_cert_dns_manual() {
     _info "验证 DNS 记录..."
     
     # 完成验证
-    if "$acme_sh" --renew -d "$domain" --yes-I-know-dns-manual-mode-enough-go-ahead-please --force 2>&1 | grep -q "Cert success"; then
+    if "$acme_sh" --renew -d "$domain" --yes-I-know-dns-manual-mode-enough-go-ahead-please --server letsencrypt --force 2>&1 | grep -q "Cert success"; then
         echo ""
         _ok "证书申请成功，安装证书..."
         
@@ -3987,7 +4009,7 @@ get_acme_cert() {
     local acme_log="/tmp/acme_output.log"
     
     # 直接执行 acme.sh，不使用 timeout（避免某些系统兼容性问题）
-    if "$acme_sh" --issue -d "$domain" --standalone --httpport 80 --force 2>&1 | tee "$acme_log" | grep -E "^\[|Verify finished|Cert success|error|Error" | sed 's/^/  /'; then
+    if "$acme_sh" --issue -d "$domain" --standalone --httpport 80 --server letsencrypt --force 2>&1 | tee "$acme_log" | grep -E "^\[|Verify finished|Cert success|error|Error" | sed 's/^/  /'; then
         echo ""
         _ok "证书申请成功，安装证书..."
         
@@ -4118,9 +4140,11 @@ setup_cert_and_nginx() {
                 
                 _ok "检测到现有证书: $CERT_DOMAIN"
                 
-                # 检查 Nginx 配置文件是否存在
+                # 检查 Nginx 配置文件是否存在（兼容旧名和域名命名格式）
                 local nginx_conf_exists=false
                 if [[ -f "/etc/nginx/conf.d/vless-fake.conf" ]] || [[ -f "/etc/nginx/sites-available/vless-fake" ]]; then
+                    nginx_conf_exists=true
+                elif [[ -n "$CERT_DOMAIN" ]] && { [[ -f "/etc/nginx/sites-available/$CERT_DOMAIN" ]] || [[ -f "/etc/nginx/conf.d/$CERT_DOMAIN.conf" ]]; }; then
                     nginx_conf_exists=true
                 fi
                 
@@ -14377,12 +14401,17 @@ setup_nginx_sub() {
     local sub_uuid=$(get_sub_uuid)
     local sub_port="${1:-2096}" domain="${2:-}" use_https="${3:-true}"
 
+    # 校验域名有效性，无效值回退到证书域名
+    if [[ -z "$domain" || "$domain" == "config-only" || "$domain" == "vless-server" || "$domain" == "_" ]]; then
+        [[ -f "$CFG/cert_domain" ]] && domain=$(cat "$CFG/cert_domain")
+    fi
+
     generate_sub_files
     local web_dir="/var/www/html"
 
     # 确定nginx配置路径和文件名
     local conf_name="${domain:-vless-server}"
-    [[ "$conf_name" == "localhost" || -z "$conf_name" ]] && conf_name="vless-server"
+    [[ "$conf_name" == "localhost" || "$conf_name" == "config-only" || -z "$conf_name" ]] && conf_name="vless-server"
     
     local nginx_conf_file=""
     local use_sites_available=false
@@ -14552,10 +14581,14 @@ EOF
                     ;;
                 5) manage_fb_port ;;
                 6) 
-                    # 使用域名作为配置文件名，若无域名则使用脚本名vless-server
-                    local refresh_name="${sub_domain:-vless-server}"
-                    [[ "$refresh_name" == "localhost" || -z "$refresh_name" ]] && refresh_name="vless-server"
-                    create_fake_website "$refresh_name" "$refresh_name"
+                    # 读取 sub.info 中保存的订阅端口，确保不被重置为默认值
+                    local refresh_port=""
+                    [[ -f "$CFG/sub.info" ]] && {
+                        local _s_uuid="" _s_port="" _s_domain="" _s_https=""
+                        source "$CFG/sub.info"
+                        refresh_port="${sub_port}"
+                    }
+                    create_fake_website "$sub_domain" "config-only" "$refresh_port"
                     _pause 
                     ;;
                 7) 

@@ -13246,10 +13246,11 @@ external_link_to_clash() {
     local json=$(parse_share_link "$link")
     [[ -z "$json" ]] && return
     
-    local type=$(echo "$json" | jq -r '.type')
-    local name=$(echo "$json" | jq -r '.name')
-    local server=$(echo "$json" | jq -r '.server')
-    local port=$(echo "$json" | jq -r '.port')
+    local type=$(echo "$json" | jq -r '.type // empty')
+    local name=$(echo "$json" | jq -r '.name // "External"')
+    local server=$(echo "$json" | jq -r '.server // empty')
+    local port=$(echo "$json" | jq -r '.port // empty')
+    [[ -z "$type" || -z "$server" || -z "$port" || ! "$port" =~ ^[0-9]+$ ]] && return
     
     # 给外部节点名称加上服务器标识，避免与本地节点重复
     local server_suffix=$(get_ip_suffix "$server")
@@ -13257,16 +13258,25 @@ external_link_to_clash() {
     
     case "$type" in
         vless)
-            local uuid=$(echo "$json" | jq -r '.uuid')
-            local security=$(echo "$json" | jq -r '.security')
-            local transport=$(echo "$json" | jq -r '.transport')
-            local sni=$(echo "$json" | jq -r '.sni')
-            local pbk=$(echo "$json" | jq -r '.pbk')
-            local sid=$(echo "$json" | jq -r '.sid')
-            local flow=$(echo "$json" | jq -r '.flow')
-            local path=$(echo "$json" | jq -r '.path')
+            local uuid=$(echo "$json" | jq -r '.uuid // empty')
+            local security=$(echo "$json" | jq -r '.security // empty')
+            local transport=$(echo "$json" | jq -r '.transport // .network // "tcp"')
+            local sni=$(echo "$json" | jq -r '.sni // empty')
+            local pbk=$(echo "$json" | jq -r '.publicKey // .pbk // empty')
+            local sid=$(echo "$json" | jq -r '.shortId // .sid // empty')
+            local flow=$(echo "$json" | jq -r '.flow // empty')
+            local path=$(echo "$json" | jq -r '.path // empty')
+            [[ -z "$uuid" ]] && return
+            [[ -z "$transport" ]] && transport="tcp"
             
-            if [[ "$security" == "reality" ]]; then
+            # 兼容旧版 Clash.Meta：避免输出空值/null 字段
+            if [[ "$security" == "reality" && -n "$pbk" ]]; then
+                local flow_line=""
+                local sni_line=""
+                local sid_line=""
+                [[ -n "$flow" ]] && flow_line="    flow: $flow"$'\n'
+                [[ -n "$sni" ]] && sni_line="    servername: $sni"$'\n'
+                [[ -n "$sid" ]] && sid_line="      short-id: $sid"$'\n'
                 cat << EOF
   - name: "$name"
     type: vless
@@ -13276,14 +13286,15 @@ external_link_to_clash() {
     network: ${transport:-tcp}
     tls: true
     udp: true
-    flow: $flow
-    servername: $sni
-    reality-opts:
+$flow_line$sni_line    reality-opts:
       public-key: $pbk
-      short-id: $sid
-    client-fingerprint: chrome
+$sid_line    client-fingerprint: chrome
 EOF
             elif [[ "$transport" == "ws" ]]; then
+                local ws_path="${path:-/}"
+                local ws_host="${sni:-$server}"
+                local sni_line=""
+                [[ -n "$sni" ]] && sni_line="    servername: $sni"$'\n'
                 cat << EOF
   - name: "$name"
     type: vless
@@ -13294,13 +13305,32 @@ EOF
     tls: true
     udp: true
     skip-cert-verify: true
-    servername: $sni
-    ws-opts:
-      path: $path
+$sni_line    ws-opts:
+      path: $ws_path
       headers:
-        Host: $sni
+        Host: $ws_host
+EOF
+            elif [[ "$transport" == "xhttp" ]]; then
+                local xhttp_path="${path:-/}"
+                local sni_line=""
+                [[ -n "$sni" ]] && sni_line="    servername: $sni"$'\n'
+                cat << EOF
+  - name: "$name"
+    type: vless
+    server: "$server"
+    port: $port
+    uuid: $uuid
+    network: xhttp
+    tls: true
+    udp: true
+    skip-cert-verify: true
+$sni_line    xhttp-opts:
+      path: $xhttp_path
+      mode: auto
 EOF
             else
+                local sni_line=""
+                [[ -n "$sni" ]] && sni_line="    servername: $sni"$'\n'
                 cat << EOF
   - name: "$name"
     type: vless
@@ -13311,17 +13341,21 @@ EOF
     tls: true
     udp: true
     skip-cert-verify: true
-    servername: $sni
+$sni_line
 EOF
             fi
             ;;
         vmess)
-            local uuid=$(echo "$json" | jq -r '.uuid')
-            local network=$(echo "$json" | jq -r '.network')
-            local tls=$(echo "$json" | jq -r '.tls')
-            local sni=$(echo "$json" | jq -r '.sni')
-            local path=$(echo "$json" | jq -r '.path')
-            local host=$(echo "$json" | jq -r '.host')
+            local uuid=$(echo "$json" | jq -r '.uuid // empty')
+            local network=$(echo "$json" | jq -r '.network // "tcp"')
+            local tls=$(echo "$json" | jq -r '.tls // empty')
+            local sni=$(echo "$json" | jq -r '.sni // empty')
+            local path=$(echo "$json" | jq -r '.path // empty')
+            local host=$(echo "$json" | jq -r '.host // empty')
+            [[ -z "$uuid" ]] && return
+            local servername="${sni:-$host}"
+            local servername_line=""
+            [[ -n "$servername" ]] && servername_line="    servername: $servername"$'\n'
             
             cat << EOF
   - name: "$name"
@@ -13334,34 +13368,46 @@ EOF
     network: ${network:-tcp}
     tls: $([[ "$tls" == "tls" ]] && echo "true" || echo "false")
     skip-cert-verify: true
-    servername: ${sni:-$host}
+$servername_line
 EOF
             if [[ "$network" == "ws" ]]; then
-                cat << EOF
+                local ws_path="${path:-/}"
+                local ws_host="${host:-$servername}"
+                if [[ -n "$ws_host" ]]; then
+                    cat << EOF
     ws-opts:
-      path: ${path:-/}
+      path: $ws_path
       headers:
-        Host: ${host:-$sni}
+        Host: $ws_host
 EOF
+                else
+                    cat << EOF
+    ws-opts:
+      path: $ws_path
+EOF
+                fi
             fi
             ;;
         trojan)
-            local password=$(echo "$json" | jq -r '.password')
-            local sni=$(echo "$json" | jq -r '.sni')
+            local password=$(echo "$json" | jq -r '.password // empty')
+            local sni=$(echo "$json" | jq -r '.sni // empty')
+            [[ -z "$password" ]] && return
+            local sni_line=""
+            [[ -n "$sni" ]] && sni_line="    sni: $sni"$'\n'
             cat << EOF
   - name: "$name"
     type: trojan
     server: "$server"
     port: $port
     password: $password
-    sni: $sni
-    skip-cert-verify: true
+$sni_line    skip-cert-verify: true
     udp: true
 EOF
             ;;
         ss)
-            local method=$(echo "$json" | jq -r '.method')
-            local password=$(echo "$json" | jq -r '.password')
+            local method=$(echo "$json" | jq -r '.method // empty')
+            local password=$(echo "$json" | jq -r '.password // empty')
+            [[ -z "$method" || -z "$password" ]] && return
             cat << EOF
   - name: "$name"
     type: ss
@@ -13373,29 +13419,33 @@ EOF
 EOF
             ;;
         hysteria2)
-            local password=$(echo "$json" | jq -r '.password')
-            local sni=$(echo "$json" | jq -r '.sni')
+            local password=$(echo "$json" | jq -r '.password // empty')
+            local sni=$(echo "$json" | jq -r '.sni // empty')
+            [[ -z "$password" ]] && return
+            local sni_line=""
+            [[ -n "$sni" ]] && sni_line="    sni: $sni"$'\n'
             cat << EOF
   - name: "$name"
     type: hysteria2
     server: "$server"
     port: $port
     password: $password
-    sni: $sni
-    skip-cert-verify: true
+$sni_line    skip-cert-verify: true
 EOF
             ;;
         anytls)
-            local password=$(echo "$json" | jq -r '.password')
-            local sni=$(echo "$json" | jq -r '.sni')
+            local password=$(echo "$json" | jq -r '.password // empty')
+            local sni=$(echo "$json" | jq -r '.sni // empty')
+            [[ -z "$password" ]] && return
+            local sni_line=""
+            [[ -n "$sni" ]] && sni_line="    sni: $sni"$'\n'
             cat << EOF
   - name: "$name"
     type: anytls
     server: "$server"
     port: $port
     password: $password
-    sni: $sni
-    skip-cert-verify: true
+$sni_line    skip-cert-verify: true
 EOF
             ;;
     esac

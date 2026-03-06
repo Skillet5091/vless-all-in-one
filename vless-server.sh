@@ -14315,6 +14315,12 @@ rule-providers:
     url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/tld-not-cn.txt
     path: ./ruleset/tld-not-cn.yaml
     interval: 86400
+  telegram:
+    type: http
+    behavior: classical
+    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Telegram/Telegram.yaml
+    path: ./ruleset/telegram.yaml
+    interval: 86400
   telegramcidr:
     type: http
     behavior: ipcidr
@@ -14405,10 +14411,14 @@ rule-providers:
 
 
 rules:
+  - PROCESS-NAME,Telegram.exe,Telegram
+  - PROCESS-NAME,Telegram,Telegram
+  - PROCESS-NAME,telegram-desktop,Telegram
+  - RULE-SET,telegram,Telegram
+  - RULE-SET,telegramcidr,Telegram,no-resolve
   - RULE-SET,YouTube,流媒体,no-resolve
   - RULE-SET,Google,Google,no-resolve
   - RULE-SET,GitHub,GitHub
-  - RULE-SET,telegramcidr,Telegram,no-resolve
   - RULE-SET,Bing,全球代理
   - RULE-SET,OpenAI,AI相关
   - RULE-SET,ClaudeAI,AI相关

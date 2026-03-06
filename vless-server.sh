@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.4.7 [服务端]
+#  多协议代理一键部署脚本 v3.4.8[服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -20,7 +20,7 @@
 
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.4.7"
+readonly VERSION="3.4.8"
 readonly AUTHOR="Skillet5091"
 readonly REPO_URL="https://github.com/Skillet5091/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -251,6 +251,49 @@ db_get_ip_routing_outbound() {
 is_standalone_protocol() {
     local proto="$1"
     [[ " $STANDALONE_PROTOCOLS " == *" $proto "* ]]
+}
+
+# 自动重建配置并重载服务
+rebuild_and_reload_xray() {
+    local mode="${1:-}"
+    [[ "$mode" != "silent" ]] && _info "正在重建 Xray 配置并重载服务..."
+    
+    # 确保证书存在
+    repair_certificates >/dev/null 2>&1
+    
+    # 先生成到临时文件测试
+    local tmp_cfg="/tmp/xray_config_test.json"
+    if generate_xray_config; then
+        # 验证配置文件
+        if xray help >/dev/null 2>&1 && ! xray run -test -c "$CFG/config.json" >/dev/null 2>&1; then
+            _err "Xray 配置文件验证失败"
+            return 1
+        fi
+        svc restart vless-reality 2>/dev/null
+        [[ "$mode" != "silent" ]] && _ok "Xray 配置已成功重载"
+        return 0
+    fi
+    return 1
+}
+
+rebuild_and_reload_singbox() {
+    local mode="${1:-}"
+    [[ "$mode" != "silent" ]] && _info "正在重建 Sing-box 配置并重载服务..."
+    
+    # 确保证书存在
+    repair_certificates >/dev/null 2>&1
+    
+    if generate_singbox_config; then
+        # 验证配置文件
+        if sing-box help >/dev/null 2>&1 && ! sing-box check -c "$CFG/singbox.json" >/dev/null 2>&1; then
+            _err "Sing-box 配置文件验证失败"
+            return 1
+        fi
+        svc restart vless-singbox 2>/dev/null
+        [[ "$mode" != "silent" ]] && _ok "Sing-box 配置已成功重载"
+        return 0
+    fi
+    return 1
 }
 
 # 添加用户到协议 (支持多端口数组格式)
@@ -2632,11 +2675,12 @@ generate_nginx_config() {
             local cert_file="$CFG/certs/server.crt"
             local key_file="$CFG/certs/server.key"
             cat > "$conf_file" << EOF
-# ${conf_name} Nginx 配置 (由 vless-server.sh 自动生成)
+# ${conf_name} Nginx 订阅配置 (由 vless-server.sh 自动生成，基于 vless-nginx.txt)
 # 域名: ${domain}
 # 回落端口: ${fb_port} (Xray TLS解密后回落)
 # 订阅端口: ${nginx_port} (公网HTTPS直接访问)
 
+# HTTP 重定向到 HTTPS (80端口)
 server {
     listen 80;
     listen [::]:80;
@@ -2646,17 +2690,21 @@ server {
     location / { return 301 https://\$host\$request_uri; }
 }
 
+# 订阅服务 (本地回落 + 公网HTTP/HTTPS)
 server {
     listen 127.0.0.1:${fb_port};
-    listen ${nginx_port} ssl http2;
-    listen [::]:${nginx_port} ssl http2;
+    listen ${nginx_port} ssl;
+    listen [::]:${nginx_port} ssl;
+    http2 on;
     server_name ${domain};
     
-    # SSL 证书
-    ssl_certificate ${cert_file};
-    ssl_certificate_key ${key_file};
+    # SSL 证书 (独立域名存放，防止覆盖错串)
+    ssl_certificate ${CFG}/certs/${domain}.crt;
+    ssl_certificate_key ${CFG}/certs/${domain}.key;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
     
     # 日志
     access_log /var/log/nginx/${conf_name}-access.log;
@@ -2707,12 +2755,12 @@ EOF
             cat > "$conf_file" << EOF
 # ${conf_name} Nginx 配置 (由 vless-server.sh 自动生成)
 # 域名: ${domain}
-# 订阅端口: ${sub_port}
+# 订阅端口: ${nginx_port}
 # 模式: reality (纯HTTP订阅服务)
 
 server {
-    listen 0.0.0.0:${sub_port};
-    listen [::]:${sub_port};
+    listen 0.0.0.0:${nginx_port};
+    listen [::]:${nginx_port};
     server_name ${domain};
     
     root ${web_dir};
@@ -2759,12 +2807,12 @@ EOF
             cat > "$conf_file" << EOF
 # ${conf_name} Nginx 配置 (由 vless-server.sh 自动生成)
 # 域名: ${domain}
-# 端口: ${sub_port}
+# 端口: ${nginx_port}
 # 模式: simple (仅HTTP单端口)
 
 server {
-    listen ${sub_port};
-    listen [::]:${sub_port};
+    listen ${nginx_port};
+    listen [::]:${nginx_port};
     server_name ${domain};
     
     root ${web_dir};
@@ -2885,6 +2933,8 @@ create_fake_website() {
     rm -f "$nginx_conf_file" 2>/dev/null
     rm -f /etc/nginx/sites-enabled/vless-fake /etc/nginx/sites-available/vless-fake 2>/dev/null
     rm -f /etc/nginx/conf.d/vless-fake.conf /etc/nginx/conf.d/vless-sub.conf 2>/dev/null
+    # 清理默认占用80端口的配置，防止 default_server 冲突
+    rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf /etc/nginx/http.d/default.conf 2>/dev/null
     # 清理 config-only 残留（旧版 bug 遗留）
     rm -f /etc/nginx/sites-enabled/config-only /etc/nginx/sites-available/config-only 2>/dev/null
     rm -f /etc/nginx/conf.d/config-only.conf 2>/dev/null
@@ -3028,16 +3078,8 @@ EOF
         # 测试Nginx配置
         _info "配置Nginx并启动Web服务..."
         if nginx -t 2>/dev/null; then
-            # 强制重启 Nginx 确保新配置生效（直接用 systemctl，更可靠）
-            if [[ "$DISTRO" == "alpine" ]]; then
-                rc-service nginx stop 2>/dev/null
-                sleep 1
-                rc-service nginx start 2>/dev/null
-            else
-                systemctl stop nginx 2>/dev/null
-                sleep 1
-                systemctl start nginx 2>/dev/null
-            fi
+            # 使用统一的 svc 函数重启 Nginx 确保新配置生效
+            svc restart nginx
             sleep 1
             
             # 验证端口是否监听（兼容不同系统）
@@ -3691,6 +3733,91 @@ install_acme_tool() {
     return 1
 }
 
+# 安装 certbot
+install_certbot_tool() {
+    if command -v certbot &>/dev/null; then
+        _ok "Certbot 已安装"
+        return 0
+    fi
+    _info "安装 Certbot 证书申请工具..."
+    case "$DISTRO" in
+        alpine)
+            apk add --no-cache certbot certbot-nginx >/dev/null 2>&1
+            ;;
+        centos)
+            yum install -y epel-release >/dev/null 2>&1
+            yum install -y certbot python3-certbot-nginx >/dev/null 2>&1
+            ;;
+        debian|ubuntu)
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot python3-certbot-nginx >/dev/null 2>&1
+            ;;
+    esac
+    if command -v certbot &>/dev/null; then
+        _ok "Certbot 安装成功"
+        return 0
+    else
+        _err "Certbot 安装失败"
+        return 1
+    fi
+}
+
+# 使用 certbot 申请证书 (Nginx 模式)
+get_certbot_cert() {
+    local domain=$1
+    local protocol="${2:-unknown}"
+    local cert_dir="$CFG/certs"
+    mkdir -p "$cert_dir"
+
+    _info "安装并配置 Certbot..."
+    install_certbot_tool || return 1
+
+    # 确保 Nginx 已安装
+    if ! command -v nginx >/dev/null 2>&1; then
+        _info "安装 Nginx..."
+        case "$DISTRO" in
+            alpine) apk add --no-cache nginx >/dev/null 2>&1 ;;
+            centos) yum install -y nginx >/dev/null 2>&1 ;;
+            debian|ubuntu) DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx >/dev/null 2>&1 ;;
+        esac
+    fi
+    
+    # 确保 80 端口可用
+    svc enable nginx 2>/dev/null
+    svc start nginx 2>/dev/null
+
+    _info "正在为 $domain 申请证书 (Certbot)..."
+    
+    local email="admin@${domain}"
+    
+    if certbot certonly --nginx -d "$domain" --non-interactive --agree-tos --email "$email" --no-eff-email; then
+        _ok "Certbot 证书申请成功"
+        
+        # 建立软链接到脚本预期位置
+        ln -sf "/etc/letsencrypt/live/$domain/fullchain.pem" "$cert_dir/${domain}.crt"
+        ln -sf "/etc/letsencrypt/live/$domain/privkey.pem" "$cert_dir/${domain}.key"
+        
+        ln -sf "$cert_dir/${domain}.key" "$cert_dir/server.key" 2>/dev/null
+        ln -sf "$cert_dir/${domain}.crt" "$cert_dir/server.crt" 2>/dev/null
+        
+        mkdir -p /etc/nginx/ssl
+        ln -sf "$cert_dir/${domain}.key" "/etc/nginx/ssl/${domain}.key" 2>/dev/null
+        ln -sf "$cert_dir/${domain}.crt" "/etc/nginx/ssl/${domain}.crt" 2>/dev/null
+        
+        echo "$domain" > "$CFG/cert_domain"
+        
+        local custom_port=""
+        [[ -f "$CFG/.nginx_port_tmp" ]] && custom_port=$(cat "$CFG/.nginx_port_tmp")
+        
+        create_fake_website "$domain" "$protocol" "$custom_port"
+        
+        diagnose_certificate "$domain"
+        return 0
+    else
+        _err "Certbot 证书申请失败"
+        return 1
+    fi
+}
+
 # DNS-01 验证申请证书
 # 参数: $1=域名 $2=证书目录 $3=协议
 _issue_cert_dns() {
@@ -3782,16 +3909,23 @@ _issue_cert_dns() {
     # 设置环境变量并申请证书
     eval "export $dns_env"
     
-    local reload_cmd="chmod 600 $cert_dir/server.key; chmod 644 $cert_dir/server.crt"
+    local reload_cmd="chmod 600 $cert_dir/${domain}.key; chmod 644 $cert_dir/${domain}.crt"
     
     if "$acme_sh" --issue -d "$domain" --dns "$dns_api" --server letsencrypt --force 2>&1 | tee /tmp/acme_dns.log | grep -E "^\[|Verify finished|Cert success|error|Error" | sed 's/^/  /'; then
         echo ""
         _ok "证书申请成功，安装证书..."
         
         "$acme_sh" --install-cert -d "$domain" \
-            --key-file       "$cert_dir/server.key"  \
-            --fullchain-file "$cert_dir/server.crt" \
+            --key-file       "$cert_dir/${domain}.key"  \
+            --fullchain-file "$cert_dir/${domain}.crt" \
             --reloadcmd      "$reload_cmd" >/dev/null 2>&1
+            
+        # 兼容引用映射与 nginx
+        ln -sf "$cert_dir/${domain}.key" "$cert_dir/server.key" 2>/dev/null
+        ln -sf "$cert_dir/${domain}.crt" "$cert_dir/server.crt" 2>/dev/null
+        mkdir -p /etc/nginx/ssl
+        ln -sf "$cert_dir/${domain}.key" "/etc/nginx/ssl/${domain}.key" 2>/dev/null
+        ln -sf "$cert_dir/${domain}.crt" "/etc/nginx/ssl/${domain}.crt" 2>/dev/null
         
         # 保存域名
         echo "$domain" > "$CFG/cert_domain"
@@ -3865,8 +3999,15 @@ _issue_cert_dns_manual() {
         _ok "证书申请成功，安装证书..."
         
         "$acme_sh" --install-cert -d "$domain" \
-            --key-file       "$cert_dir/server.key"  \
-            --fullchain-file "$cert_dir/server.crt" >/dev/null 2>&1
+            --key-file       "$cert_dir/${domain}.key"  \
+            --fullchain-file "$cert_dir/${domain}.crt" >/dev/null 2>&1
+            
+        # 兼容引用映射与 nginx
+        ln -sf "$cert_dir/${domain}.key" "$cert_dir/server.key" 2>/dev/null
+        ln -sf "$cert_dir/${domain}.crt" "$cert_dir/server.crt" 2>/dev/null
+        mkdir -p /etc/nginx/ssl
+        ln -sf "$cert_dir/${domain}.key" "/etc/nginx/ssl/${domain}.key" 2>/dev/null
+        ln -sf "$cert_dir/${domain}.crt" "/etc/nginx/ssl/${domain}.crt" 2>/dev/null
         
         echo "$domain" > "$CFG/cert_domain"
         
@@ -3895,10 +4036,10 @@ get_acme_cert() {
     # 检查是否已有相同域名的证书
     if [[ -f "$CFG/cert_domain" ]]; then
         local existing_domain=$(cat "$CFG/cert_domain")
-        if [[ "$existing_domain" == "$domain" && -f "$cert_dir/server.crt" && -f "$cert_dir/server.key" ]]; then
+        if [[ "$existing_domain" == "$domain" && -f "$cert_dir/${domain}.crt" && -f "$cert_dir/${domain}.key" ]]; then
             _ok "检测到相同域名的现有证书，跳过申请"
             # 检查证书是否仍然有效
-            if openssl x509 -in "$cert_dir/server.crt" -noout -checkend 2592000 >/dev/null 2>&1; then
+            if openssl x509 -in "$cert_dir/${domain}.crt" -noout -checkend 2592000 >/dev/null 2>&1; then
                 _ok "现有证书仍然有效（30天以上）"
                 
                 # 读取自定义 nginx 端口（如果有）
@@ -3956,24 +4097,30 @@ get_acme_cert() {
     echo -e "  • 证书有效期: 90天 (自动续期)"
     echo ""
     echo -e "  ${Y}请选择验证方式：${NC}"
-    echo -e "  1) HTTP 验证 (需要80端口，推荐)"
-    echo -e "  2) DNS 验证 (无需80端口，适合NAT/无公网IP)"
-    echo -e "  3) 取消"
+    echo -e "  1) Certbot 验证 (推荐，使用 Nginx 插件自动管理)"
+    echo -e "  2) HTTP 验证 (使用 acme.sh standalone 模式)"
+    echo -e "  3) DNS 验证 (使用 acme.sh，无需80端口)"
+    echo -e "  4) 取消"
     echo ""
-    read -rp "  请选择 [1-3]: " verify_method
+    read -rp "  请选择 [1-4]: " verify_method
     
     case "$verify_method" in
-        2)
+        1|"")
+            # Certbot 验证模式（默认）
+            get_certbot_cert "$domain" "$protocol"
+            return $?
+            ;;
+        3)
             # DNS 验证模式
             _issue_cert_dns "$domain" "$cert_dir" "$protocol"
             return $?
             ;;
-        3)
+        4)
             _info "已取消证书申请"
             return 2
             ;;
-        1|"")
-            # HTTP 验证模式（默认）
+        2)
+            # HTTP 验证模式 (acme.sh)
             ;;
         *)
             _err "无效选择"
@@ -3981,8 +4128,8 @@ get_acme_cert() {
             ;;
     esac
     
-    # 用户确认后再安装 acme.sh
-    _info "安装证书申请工具..."
+    # 用户选择 2 (acme.sh) 后安装 acme.sh
+    _info "安装 acme.sh 证书申请工具..."
     install_acme_tool || return 1
     
     local acme_sh="$HOME/.acme.sh/acme.sh"
@@ -4003,7 +4150,7 @@ get_acme_cert() {
     [[ -z "$server_ip" ]] && server_ip=$(get_ipv6)
     
     # 构建 reloadcmd（兼容 systemd 和 OpenRC）
-    local reload_cmd="chmod 600 $cert_dir/server.key; chmod 644 $cert_dir/server.crt; chown root:root $cert_dir/server.key $cert_dir/server.crt; if command -v systemctl >/dev/null 2>&1; then systemctl restart vless-reality vless-singbox 2>/dev/null || true; elif command -v rc-service >/dev/null 2>&1; then rc-service vless-reality restart 2>/dev/null || true; rc-service vless-singbox restart 2>/dev/null || true; fi"
+    local reload_cmd="chmod 600 $cert_dir/${domain}.key; chmod 644 $cert_dir/${domain}.crt; chown root:root $cert_dir/${domain}.key $cert_dir/${domain}.crt; if command -v systemctl >/dev/null 2>&1; then systemctl restart vless-reality vless-singbox 2>/dev/null || true; elif command -v rc-service >/dev/null 2>&1; then rc-service vless-reality restart 2>/dev/null || true; rc-service vless-singbox restart 2>/dev/null || true; fi"
     
     # 使用 standalone 模式申请证书，显示实时进度
     local acme_log="/tmp/acme_output.log"
@@ -4015,9 +4162,17 @@ get_acme_cert() {
         
         # 安装证书到指定目录，并设置权限和自动重启服务
         "$acme_sh" --install-cert -d "$domain" \
-            --key-file       "$cert_dir/server.key"  \
-            --fullchain-file "$cert_dir/server.crt" \
+            --key-file       "$cert_dir/${domain}.key"  \
+            --fullchain-file "$cert_dir/${domain}.crt" \
             --reloadcmd      "$reload_cmd" >/dev/null 2>&1
+            
+        # 兼容旧版的全局静态引用，做软链接
+        ln -sf "$cert_dir/${domain}.key" "$cert_dir/server.key" 2>/dev/null
+        ln -sf "$cert_dir/${domain}.crt" "$cert_dir/server.crt" 2>/dev/null
+        # 同步给系统 nginx
+        mkdir -p /etc/nginx/ssl
+        ln -sf "$cert_dir/${domain}.key" "/etc/nginx/ssl/${domain}.key" 2>/dev/null
+        ln -sf "$cert_dir/${domain}.crt" "/etc/nginx/ssl/${domain}.crt" 2>/dev/null
         
         rm -f "$acme_log"
         
@@ -4037,7 +4192,7 @@ get_acme_cert() {
         create_fake_website "$domain" "$protocol" "$custom_port"
         
         # 验证证书文件
-        if [[ -f "$cert_dir/server.crt" && -f "$cert_dir/server.key" ]]; then
+        if [[ -f "$cert_dir/${domain}.crt" && -f "$cert_dir/${domain}.key" ]]; then
             _ok "证书文件验证通过"
             # 运行证书诊断
             diagnose_certificate "$domain"
@@ -4082,7 +4237,14 @@ setup_cert_and_nginx() {
     
     # 全局变量，供调用方使用
     CERT_DOMAIN=""
-    NGINX_PORT="$default_nginx_port"
+    
+    # 读取已有的订阅配置（优先使用实际配置的端口）
+    if [[ -f "$CFG/sub.info" ]]; then
+        source "$CFG/sub.info" 2>/dev/null
+        NGINX_PORT="${sub_port:-$default_nginx_port}"
+    else
+        NGINX_PORT="$default_nginx_port"
+    fi
     
     # === 回落子协议检测：如果是 WS 协议且有主协议，跳过 Nginx 配置 ===
     local is_fallback_mode=false
@@ -4092,15 +4254,25 @@ setup_cert_and_nginx() {
         fi
     fi
     
-    # 检测是否已有证书
-    if [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" ]]; then
+    # 检测是否已有证书 (优先检查域名专属证书，兼容旧版 server.crt)
+    local existing_cert=""
+    if [[ -f "$CFG/cert_domain" ]]; then
+        local read_domain=$(cat "$CFG/cert_domain")
+        if [[ -f "$CFG/certs/${read_domain}.crt" ]]; then
+            existing_cert="$CFG/certs/${read_domain}.crt"
+        elif [[ -f "$CFG/certs/server.crt" ]]; then
+            existing_cert="$CFG/certs/server.crt"
+        fi
+    fi
+    
+    if [[ -n "$existing_cert" ]]; then
         # 验证证书是否有效
-        if openssl x509 -in "$CFG/certs/server.crt" -noout -checkend 2592000 >/dev/null 2>&1; then
+        if openssl x509 -in "$existing_cert" -noout -checkend 2592000 >/dev/null 2>&1; then
             CERT_DOMAIN=$(cat "$CFG/cert_domain")
             
             # 检查是否是自签名证书
             local is_self_signed=true
-            local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
+            local issuer=$(openssl x509 -in "$existing_cert" -noout -issuer 2>/dev/null)
             if [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"R11"* ]] || [[ "$issuer" == *"E1"* ]] || [[ "$issuer" == *"ZeroSSL"* ]] || [[ "$issuer" == *"Buypass"* ]]; then
                 is_self_signed=false
             fi
@@ -4116,7 +4288,7 @@ setup_cert_and_nginx() {
                 
                 if [[ "$self_cert_choice" != "2" ]]; then
                     # 用户选择申请真实证书，清除旧证书，走正常申请流程
-                    rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key" "$CFG/cert_domain"
+                    rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key" "$CFG/cert_domain" "$CFG/certs/${read_domain}.crt" "$CFG/certs/${read_domain}.key" 2>/dev/null
                     CERT_DOMAIN=""
                     # 继续往下走到证书申请流程
                 else
@@ -4130,12 +4302,6 @@ setup_cert_and_nginx() {
                 if [[ "$is_fallback_mode" == "true" ]]; then
                     _ok "检测到现有证书: $CERT_DOMAIN (回落模式，跳过 Nginx)"
                     return 0
-                fi
-                
-                # 读取已有的订阅配置
-                if [[ -f "$CFG/sub.info" ]]; then
-                    source "$CFG/sub.info" 2>/dev/null
-                    NGINX_PORT="${sub_port:-$default_nginx_port}"
                 fi
                 
                 _ok "检测到现有证书: $CERT_DOMAIN"
@@ -4254,9 +4420,9 @@ ask_sni_config() {
     local cert_domain="${2:-}"
     
     # 如果有证书域名，检查是否是真实证书
-    if [[ -n "$cert_domain" && -f "$CFG/certs/server.crt" ]]; then
+    if [[ -n "$cert_domain" && -f "$CFG/certs/${cert_domain}.crt" ]]; then
         local is_real_cert=false
-        local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
+        local issuer=$(openssl x509 -in "$CFG/certs/${cert_domain}.crt" -noout -issuer 2>/dev/null)
         if [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"R11"* ]] || [[ "$issuer" == *"E1"* ]] || [[ "$issuer" == *"ZeroSSL"* ]] || [[ "$issuer" == *"Buypass"* ]]; then
             is_real_cert=true
         fi
@@ -4362,13 +4528,15 @@ ask_cert_config() {
     local protocol="${2:-unknown}"
     
     # 检查是否已有 ACME 证书，如果有则直接复用
-    if [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" ]]; then
+    if [[ -f "$CFG/cert_domain" ]]; then
         local existing_domain=$(cat "$CFG/cert_domain")
-        local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-        if [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"R11"* ]]; then
-            _ok "检测到现有 ACME 证书: $existing_domain，自动复用" >&2
-            echo "$existing_domain"
-            return 0
+        if [[ -f "$CFG/certs/${existing_domain}.crt" ]]; then
+            local issuer=$(openssl x509 -in "$CFG/certs/${existing_domain}.crt" -noout -issuer 2>/dev/null)
+            if [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"R11"* ]]; then
+                _ok "检测到现有 ACME 证书: $existing_domain，自动复用" >&2
+                echo "$existing_domain"
+                return 0
+            fi
         fi
     fi
     
@@ -4509,12 +4677,34 @@ _map_arch() {
 
 # 通用二进制下载安装函数
 _install_binary() {
-    local name="$1" repo="$2" url_pattern="$3" extract_cmd="$4"
-    check_cmd "$name" && { _ok "$name 已安装"; return 0; }
+    local name="$1" repo="$2" url_pattern="$3" extract_cmd="$4" force_update="$5"
+    
+    local current_version=""
+    if check_cmd "$name"; then
+        if [[ "$force_update" != "true" ]]; then
+            _ok "$name 已安装"
+            return 0
+        fi
+        if [[ "$name" == "xray" ]]; then
+            current_version=$(xray version 2>/dev/null | head -n 1 | awk '{print $2}')
+        elif [[ "$name" == "sing-box" ]]; then
+            current_version=$(sing-box version 2>/dev/null | grep version | awk '{print $3}')
+        fi
+    fi
     
     _info "安装 $name (获取最新版本)..."
     local version=$(_get_latest_version "$repo")
     [[ -z "$version" ]] && { _err "获取 $name 版本失败"; return 1; }
+    
+    if [[ -n "$current_version" ]]; then
+        local cv=${current_version#v}
+        local nv=${version#v}
+        if [[ "$cv" == "$nv" ]]; then
+            # _ok "$name 已是最新版本 (v$cv)" # 静默模式下不输出
+            return 0
+        fi
+        _info "发现 $name 新版本: v$cv -> v$nv，正在从上游更新..."
+    fi
     
     local arch=$(uname -m)
     local tmp=$(mktemp -d)
@@ -4532,6 +4722,7 @@ _install_binary() {
 }
 
 install_xray() {
+    local force_update="$1"
     local xarch=$(_map_arch "64:arm64-v8a:arm32-v7a") || { _err "不支持的架构"; return 1; }
     # Alpine 需要安装 gcompat 兼容层来运行 glibc 编译的二进制
     if [[ "$DISTRO" == "alpine" ]]; then
@@ -4539,7 +4730,8 @@ install_xray() {
     fi
     _install_binary "xray" "XTLS/Xray-core" \
         'https://github.com/XTLS/Xray-core/releases/download/v$version/Xray-linux-${xarch}.zip' \
-        'unzip -oq "$tmp/pkg" -d "$tmp/" && install -m 755 "$tmp/xray" /usr/local/bin/xray && mkdir -p /usr/local/share/xray && cp "$tmp"/*.dat /usr/local/share/xray/ 2>/dev/null; fix_selinux_context'
+        'unzip -oq "$tmp/pkg" -d "$tmp/" && install -m 755 "$tmp/xray" /usr/local/bin/xray && mkdir -p /usr/local/share/xray && cp "$tmp"/*.dat /usr/local/share/xray/ 2>/dev/null; fix_selinux_context' \
+        "$force_update"
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -4547,6 +4739,7 @@ install_xray() {
 #═══════════════════════════════════════════════════════════════════════════════
 
 install_singbox() {
+    local force_update="$1"
     local sarch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
     # Alpine 需要安装 gcompat 兼容层来运行 glibc 编译的二进制
     if [[ "$DISTRO" == "alpine" ]]; then
@@ -4554,7 +4747,8 @@ install_singbox() {
     fi
     _install_binary "sing-box" "SagerNet/sing-box" \
         'https://github.com/SagerNet/sing-box/releases/download/v$version/sing-box-$version-linux-${sarch}.tar.gz' \
-        'tar -xzf "$tmp/pkg" -C "$tmp/" && install -m 755 "$(find "$tmp" -name sing-box -type f | head -1)" /usr/local/bin/sing-box'
+        'tar -xzf "$tmp/pkg" -C "$tmp/" && install -m 755 "$(find "$tmp" -name sing-box -type f | head -1)" /usr/local/bin/sing-box' \
+        "$force_update"
 }
 
 # 生成 Sing-box 统一配置 (Hy2 + TUIC 共用一个进程)
@@ -4646,11 +4840,11 @@ generate_singbox_config() {
                 # 智能证书选择：优先使用 ACME 证书，否则使用 hy2 独立自签证书
                 local cert_path="$CFG/certs/hy2/server.crt"
                 local key_path="$CFG/certs/hy2/server.key"
-                if [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" ]]; then
+                if [[ -f "$CFG/cert_domain" ]]; then
                     local cert_domain=$(cat "$CFG/cert_domain" 2>/dev/null)
-                    if [[ "$sni" == "$cert_domain" ]]; then
-                        cert_path="$CFG/certs/server.crt"
-                        key_path="$CFG/certs/server.key"
+                    if [[ "$sni" == "$cert_domain" && -f "$CFG/certs/${cert_domain}.crt" ]]; then
+                        cert_path="$CFG/certs/${cert_domain}.crt"
+                        key_path="$CFG/certs/${cert_domain}.key"
                     fi
                 fi
                 
@@ -4933,20 +5127,86 @@ gen_self_cert() {
     mkdir -p "$CFG/certs"
     
     # 检查是否应该保护现有证书
-    if [[ -f "$CFG/certs/server.crt" ]]; then
+    local domain_cert="$CFG/certs/${domain}.crt"
+    if [[ -f "$domain_cert" ]]; then
         [[ -f "$CFG/cert_domain" ]] && { _ok "检测到已申请的证书，跳过"; return 0; }
         # 检查是否为 CA 签发的证书
-        local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
+        local issuer=$(openssl x509 -in "$domain_cert" -noout -issuer 2>/dev/null)
         [[ "$issuer" =~ (Let\'s\ Encrypt|R3|R10|R11|E1|E5|ZeroSSL|Buypass|DigiCert|Comodo|GlobalSign) ]] && \
             { _ok "检测到 CA 证书，跳过"; return 0; }
     fi
     
-    rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key"
+    rm -f "$domain_cert" "$CFG/certs/${domain}.key" "$CFG/certs/server.crt" "$CFG/certs/server.key"
     _info "生成自签名证书..."
     openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
-        -keyout "$CFG/certs/server.key" -out "$CFG/certs/server.crt" \
+        -keyout "$CFG/certs/${domain}.key" -out "$domain_cert" \
         -subj "/CN=$domain" -days 36500 2>/dev/null
-    chmod 600 "$CFG/certs/server.key"
+    chmod 600 "$CFG/certs/${domain}.key"
+    
+    # 向下软链接兼容
+    ln -sf "$CFG/certs/${domain}.key" "$CFG/certs/server.key" 2>/dev/null
+    ln -sf "$domain_cert" "$CFG/certs/server.crt" 2>/dev/null
+}
+
+# 修复丢失的证书（从 acme.sh 恢复或重新生成自签）
+repair_certificates() {
+    local cert_dir="$CFG/certs"
+    mkdir -p "$cert_dir"
+    
+    local domain=""
+    [[ -f "$CFG/cert_domain" ]] && domain=$(cat "$CFG/cert_domain")
+    
+    # 1. 修复主证书 (server.crt)
+    if [[ ! -f "$cert_dir/server.crt" || ! -f "$cert_dir/server.key" ]]; then
+        if [[ -n "$domain" ]]; then
+            # 尝试从 acme.sh 恢复
+            local acme_dir="$HOME/.acme.sh/${domain}_ecc"
+            if [[ -f "$acme_dir/fullchain.cer" && -f "$acme_dir/${domain}.key" ]]; then
+                _info "从 acme.sh 恢复证书: $domain"
+                ln -sf "$acme_dir/fullchain.cer" "$cert_dir/${domain}.crt" 2>/dev/null
+                ln -sf "$acme_dir/${domain}.key" "$cert_dir/${domain}.key" 2>/dev/null
+                ln -sf "$cert_dir/${domain}.crt" "$cert_dir/server.crt" 2>/dev/null
+                ln -sf "$cert_dir/${domain}.key" "$cert_dir/server.key" 2>/dev/null
+            else
+                _info "重新生成自签证书: $domain"
+                gen_self_cert "$domain"
+            fi
+        else
+            _info "重新生成自签证书: localhost"
+            gen_self_cert "localhost"
+        fi
+    fi
+    
+    # 2. 修复 Hysteria2 证书
+    if db_exists "singbox" "hy2"; then
+        local hy2_sni=$(db_get_field "singbox" "hy2" "sni")
+        local hy2_cert_dir="$cert_dir/hy2"
+        mkdir -p "$hy2_cert_dir"
+        if [[ ! -f "$hy2_cert_dir/server.crt" || ! -f "$hy2_cert_dir/server.key" ]]; then
+            if [[ -n "$domain" && "$hy2_sni" == "$domain" && -f "$cert_dir/server.crt" ]]; then
+                _info "为 Hysteria2 复用主证书"
+                ln -sf "$cert_dir/server.crt" "$hy2_cert_dir/server.crt" 2>/dev/null
+                ln -sf "$cert_dir/server.key" "$hy2_cert_dir/server.key" 2>/dev/null
+            else
+                _info "为 Hysteria2 重新生成自签证书"
+                openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+                    -keyout "$hy2_cert_dir/server.key" -out "$hy2_cert_dir/server.crt" \
+                    -subj "/CN=${hy2_sni:-localhost}" -days 36500 2>/dev/null
+                chmod 600 "$hy2_cert_dir/server.key"
+            fi
+        fi
+    fi
+    
+    # 3. 修复 TUIC 证书
+    if db_exists "singbox" "tuic"; then
+        local tuic_cert_dir="$cert_dir/tuic"
+        mkdir -p "$tuic_cert_dir"
+        if [[ ! -f "$tuic_cert_dir/server.crt" || ! -f "$tuic_cert_dir/server.key" ]]; then
+            _info "为 TUIC 复用主证书"
+            ln -sf "$cert_dir/server.crt" "$tuic_cert_dir/server.crt" 2>/dev/null
+            ln -sf "$cert_dir/server.key" "$tuic_cert_dir/server.key" 2>/dev/null
+        fi
+    fi
 }
 
 
@@ -5729,6 +5989,9 @@ start_services() {
     # 初始化数据库
     init_db
     
+    # 确保证书存在 (防止手动清理或迁移导致的证书丢失)
+    repair_certificates >/dev/null 2>&1
+    
     # 服务端：启动所有已注册的协议服务
     
     # 1. 启动 Xray 服务（TCP 协议）
@@ -6011,6 +6274,44 @@ _auto_update_system_script() {
             hash -r 2>/dev/null
             _ok "系统脚本已同步更新 (v$VERSION)"
         fi
+    fi
+}
+
+# 自动更新核心组件
+_auto_update_cores() {
+    if [[ ! -f "$CFG/db.json" ]]; then return; fi
+    
+    local auto_update=$(jq -r '.auto_update_core // true' "$CFG/db.json" 2>/dev/null)
+    if [[ "$auto_update" == "false" ]]; then return; fi
+    
+    local updated_xray=false
+    local updated_singbox=false
+    
+    if check_cmd xray && [[ -n $(db_list_protocols "xray") ]]; then
+        local old_ver=$(xray version 2>/dev/null | head -n 1 | awk '{print $2}')
+        install_xray "true" >/dev/null 2>&1
+        local new_ver=$(xray version 2>/dev/null | head -n 1 | awk '{print $2}')
+        if [[ "$old_ver" != "$new_ver" && -n "$new_ver" ]]; then
+            updated_xray=true
+        fi
+    fi
+    
+    if check_cmd sing-box && [[ -n $(db_list_protocols "singbox") ]]; then
+        local old_ver=$(sing-box version 2>/dev/null | grep version | awk '{print $3}')
+        install_singbox "true" >/dev/null 2>&1
+        local new_ver=$(sing-box version 2>/dev/null | grep version | awk '{print $3}')
+        if [[ "$old_ver" != "$new_ver" && -n "$new_ver" ]]; then
+            updated_singbox=true
+        fi
+    fi
+    
+    if [[ "$updated_xray" == "true" ]]; then
+        _info "已自动从上游更新 Xray 核心到 v${new_ver#v}，正在重启服务..."
+        svc restart vless-reality 2>/dev/null
+    fi
+    if [[ "$updated_singbox" == "true" ]]; then
+        _info "已自动从上游更新 Sing-box 核心到 v${new_ver#v}，正在重启服务..."
+        svc restart vless-singbox 2>/dev/null
     fi
 }
 
@@ -14589,6 +14890,10 @@ EOF
                         refresh_port="${sub_port}"
                     }
                     create_fake_website "$sub_domain" "config-only" "$refresh_port"
+                    # 联动更新核心服务配置并重启
+                    rebuild_and_reload_xray "silent"
+                    rebuild_and_reload_singbox "silent"
+                    _ok "Nginx 订阅服务已刷新，核心服务已重载"
                     _pause 
                     ;;
                 7) 
@@ -15833,13 +16138,129 @@ do_update() {
     fi
 }
 
+_force_update_cores() {
+    _header
+    echo -e "  ${W}强制核心组件更新${NC}"
+    _line
+    _info "尝试强制从上游获取最新 Xray / Sing-box 核心..."
+    
+    local updated=false
+    if check_cmd xray && [[ -n $(db_list_protocols "xray") ]]; then
+        install_xray "true"
+        svc restart vless-reality 2>/dev/null
+        updated=true
+    fi
+    if check_cmd sing-box && [[ -n $(db_list_protocols "singbox") ]]; then
+        install_singbox "true"
+        svc restart vless-singbox 2>/dev/null
+        updated=true
+    fi
+    
+    if [[ "$updated" == "true" ]]; then
+        _ok "核心组件升级完成并已重启"
+    else
+        _warn "未发现已安装并且在使用中的核心"
+    fi
+    _pause
+}
+
+_toggle_auto_update_core() {
+    _header
+    echo -e "  ${W}自动更新核心配置${NC}"
+    _line
+    
+    if [[ ! -f "$CFG/db.json" ]]; then
+        _err "未找到数据库配置，无法修改"
+        _pause
+        return
+    fi
+    
+    local current=$(jq -r '.auto_update_core // true' "$CFG/db.json" 2>/dev/null)
+    local new_val="true"
+    [[ "$current" == "true" ]] && new_val="false"
+    
+    local tmp_db=$(mktemp)
+    if jq --arg val "$new_val" '.auto_update_core = ($val == "true")' "$CFG/db.json" > "$tmp_db" 2>/dev/null; then
+        mv "$tmp_db" "$CFG/db.json"
+        _ok "开机/启动自动更新核心已 $([[ "$new_val" == "true" ]] && echo -e "${G}开启${NC}" || echo -e "${R}关闭${NC}")"
+    else
+        rm -f "$tmp_db"
+        _err "修改配置失败"
+    fi
+    _pause
+}
+
+_force_renew_cert() {
+    _header
+    echo -e "  ${W}强制续期现有证书${NC}"
+    _line
+    
+    if [[ ! -f "$CFG/cert_domain" ]]; then
+        _warn "未在此服务器找到配置的证书域名"
+        _pause
+        return
+    fi
+    
+    local domain=$(cat "$CFG/cert_domain")
+    _info "尝试为域名 $domain 强制续期 ACME 证书..."
+    
+    local acme_sh="$HOME/.acme.sh/acme.sh"
+    if [[ -f "$acme_sh" ]]; then
+        # 构建 reloadcmd 以重新启动相关服务
+        local reload_cmd="if command -v systemctl >/dev/null 2>&1; then systemctl restart vless-reality vless-singbox 2>/dev/null || true; elif command -v rc-service >/dev/null 2>&1; then rc-service vless-reality restart 2>/dev/null || true; rc-service vless-singbox restart 2>/dev/null || true; fi"
+        
+        "$acme_sh" --renew -d "$domain" --force --reloadcmd "$reload_cmd"
+        _ok "续期流程执行完毕，已重载对应服务"
+    else
+        _err "未找到 acme.sh 安装，可能是使用自签名证书或其他申请方式"
+    fi
+    _pause
+}
+
+update_manage_menu() {
+    while true; do
+        _header
+        echo -e "  ${W}检查及更新管理${NC}"
+        _line
+        
+        local current_auto=""
+        if [[ -f "$CFG/db.json" ]]; then
+            local auto_val=$(jq -r '.auto_update_core // true' "$CFG/db.json" 2>/dev/null)
+            if [[ "$auto_val" == "true" ]]; then
+                current_auto="${G}[已开启]${NC}"
+            else
+                current_auto="${R}[已关闭]${NC}"
+            fi
+        fi
+        
+        _item "1" "检查并更新脚本 (现有的 do_update)"
+        _item "2" "核心组件立即更新 (强制重拉 Xray/Sing-box 新版)"
+        _item "3" "配置启动自动更新核心 $current_auto"
+        _item "4" "强制续期 ACME 证书"
+        _item "0" "返回上级菜单"
+        _line
+        
+        read -rp "  请选择: " uc
+        case "$uc" in
+            1) do_update ;;
+            2) _force_update_cores ;;
+            3) _toggle_auto_update_core ;;
+            4) _force_renew_cert ;;
+            0) return ;;
+            *) _err "无效选择" ;;
+        esac
+    done
+}
+
 main_menu() {
     check_root
     init_log  # 初始化日志
     init_db   # 初始化 JSON 数据库
     
-    # 自动更新系统脚本 (确保 vless 命令始终是最新版本)
+    # 初始化操作
+    _cleanup_temp
     _auto_update_system_script
+    _auto_update_cores
     
     while true; do
         _header
@@ -15853,23 +16274,31 @@ main_menu() {
         # 复用 show_status 缓存的结果，避免重复查询数据库
         local installed="$_INSTALLED_CACHE"
         if [[ -n "$installed" ]]; then
-            # 多协议服务端菜单
+            echo -e "  ${C}============== 安装与配置 ==============${NC}"
             _item "1" "安装新协议 (多协议共存)"
             _item "2" "查看所有协议配置"
-            _item "3" "订阅服务管理"
-            _item "4" "管理协议服务"
-            _item "5" "分流管理"
-            _item "6" "配置管理 (导入/导出)"
-            _item "7" "BBR 网络优化"
-            _item "8" "卸载指定协议"
-            _item "9" "完全卸载"
-            _item "l" "查看运行日志"
-            _item "a" "伪装站管理"
-            _item "m" "用户管理 (多用户/流量/TG通知)"
+            _item "3" "配置管理 (导入/导出)"
+            echo -e "  ${C}============== 工具与服务 ==============${NC}"
+            _item "4" "订阅服务管理"
+            _item "5" "用户管理 (多用户/流量/TG通知)"
+            _item "6" "管理协议服务"
+            _item "7" "分流管理"
+            _item "8" "伪装站管理"
+            echo -e "  ${C}============== 系统与优化 ==============${NC}"
+            _item "9" "BBR 网络优化"
+            _item "10" "查看运行日志"
+            _item "11" "检查及更新管理"
+            echo -e "  ${C}============== 卸载与退出 ==============${NC}"
+            _item "12" "卸载指定协议"
+            _item "13" "完全卸载"
         else
+            echo -e "  ${C}============== 安装与配置 ==============${NC}"
             _item "1" "安装协议"
+            echo -e "  ${C}============== 系统与优化 ==============${NC}"
+            _item "9" "BBR 网络优化"
+            _item "11" "检查及更新管理"
+            echo -e "  ${C}============== 卸载与退出 ==============${NC}"
         fi
-        _item "u" "检查更新"
         _item "0" "退出"
         _line
 
@@ -15880,24 +16309,25 @@ main_menu() {
             case $choice in
                 1) do_install_server ;;
                 2) show_all_protocols_info ;;
-                3) manage_subscription ;;
-                4) manage_protocol_services ;;
-                5) manage_routing ;;
-                6) manage_config ;;
-                7) enable_bbr ;;
-                8) uninstall_specific_protocol ;;
-                9) do_uninstall ;;
-                l|L) show_logs ;;
-                a|A) manage_masquerade ;;
-                m|M) manage_users ;;
-                u|U) do_update ;;
+                3) manage_config ;;
+                4) manage_subscription ;;
+                5) manage_users ;;
+                6) manage_protocol_services ;;
+                7) manage_routing ;;
+                8) manage_masquerade ;;
+                9) enable_bbr ;;
+                10) show_logs ;;
+                11) update_manage_menu ;;
+                12) uninstall_specific_protocol ;;
+                13) do_uninstall ;;
                 0) exit 0 ;;
                 *) _err "无效选择" ;;
             esac
         else
             case $choice in
                 1) do_install_server ;;
-                u|U) do_update ;;
+                9) enable_bbr ;;
+                11) update_manage_menu ;;
                 0) exit 0 ;;
                 *) _err "无效选择" ;;
             esac

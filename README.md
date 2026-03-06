@@ -1,4 +1,4 @@
-﻿# 多协议代理一键部署脚本 v3.4.7
+﻿# 多协议代理一键部署脚本 v3.4.9
 
 一个强大且智能的多协议代理部署脚本，支持 **13 种主流协议**，具备 **Smart Fallback 端口复用 (443)**、**CDN 自动匹配**、**高级伪装网** 等前沿特性。
 
@@ -467,6 +467,17 @@ MIT License
 ---
 
 ## 📝 更新日志
+
+### v3.4.9 (2026-03-06)
+
+- 🔧 **Clash 订阅兼容性修复**
+  - `rule-providers` 的 `.txt` 规则源补充 `format: text`
+  - 修复旧版 Mihomo/Clash.Meta（如 `v1.18.7`）因空值字段导致的配置加载失败
+  - 外部 VLESS 节点解析兼容 `publicKey/shortId` 与 `pbk/sid` 字段
+- 📡 **Telegram 分流修复**
+  - 新增 Telegram 规则集并提高优先级，避免被 `Google` 规则误命中
+  - 增加 Telegram 进程规则匹配（Windows/Linux）
+
 
 ### v3.4.7 (2025-02-05)
 

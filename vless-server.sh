@@ -13772,10 +13772,6 @@ gen_v2ray_sub() {
         server_ip="[$ipv6]"
     fi
     
-    # 检查是否有主协议（用于判断 WS 协议是否为回落子协议）
-    local master_port=""
-    master_port=$(_get_master_port "")
-    
     for protocol in $installed; do
         # 从数据库读取配置
         local cfg=""
@@ -13802,10 +13798,8 @@ gen_v2ray_sub() {
         # 对于回落子协议，使用主协议端口
         local actual_port="$port"
         if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" ]]; then
-            if [[ -n "$outer_port" && "$outer_port" != "$port" ]]; then
+            if [[ -n "$outer_port" ]]; then
                 actual_port="$outer_port"
-            elif [[ -n "$master_port" ]]; then
-                actual_port="$master_port"
             fi
         fi
         
@@ -13892,9 +13886,6 @@ gen_clash_sub() {
         ip_suffix=$(get_ip_suffix "$ipv6")
     fi
     
-    local master_port=""
-    master_port=$(_get_master_port "")
-    
     # 1. 处理本地安装的协议
     for protocol in $installed; do
         local cfg=""
@@ -13917,10 +13908,8 @@ gen_clash_sub() {
         
         local actual_port="$port"
         if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" ]]; then
-            if [[ -n "$outer_port" && "$outer_port" != "$port" ]]; then
+            if [[ -n "$outer_port" ]]; then
                 actual_port="$outer_port"
-            elif [[ -n "$master_port" ]]; then
-                actual_port="$master_port"
             fi
         fi
         
@@ -14561,10 +14550,6 @@ gen_singbox_sub() {
         ip_suffix=$(get_ip_suffix "$ipv6")
     fi
     
-    # 检查是否有主协议
-    local master_port=""
-    master_port=$(_get_master_port "")
-    
     local first=true
     for protocol in $installed; do
         local cfg=""
@@ -14587,10 +14572,8 @@ gen_singbox_sub() {
         
         local actual_port="$port"
         if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" ]]; then
-            if [[ -n "$outer_port" && "$outer_port" != "$port" ]]; then
+            if [[ -n "$outer_port" ]]; then
                 actual_port="$outer_port"
-            elif [[ -n "$master_port" ]]; then
-                actual_port="$master_port"
             fi
         fi
         

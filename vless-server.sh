@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.4.12[服务端]
+#  多协议代理一键部署脚本 v3.4.13[服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -20,7 +20,7 @@
 
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.4.12"
+readonly VERSION="3.4.13"
 readonly AUTHOR="Skillet5091"
 readonly REPO_URL="https://github.com/Skillet5091/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -15114,11 +15114,20 @@ setup_subscription_interactive() {
     # 域名
     echo -e "  ${D}留空使用服务器IP${NC}"
     read -rp "  域名 (可选): " sub_domain
-    
-    # HTTPS
-    local use_https="true"
-    read -rp "  启用 HTTPS? [Y/n]: " https_choice
-    [[ "$https_choice" =~ ^[nN]$ ]] && use_https="false"
+
+    # HTTPS：无域名时默认关闭；有域名时默认开启
+    local use_https="false"
+    if [[ -n "$sub_domain" ]]; then
+        use_https="true"
+        read -rp "  启用 HTTPS? [Y/n]: " https_choice
+        [[ "$https_choice" =~ ^[nN]$ ]] && use_https="false"
+    else
+        read -rp "  未填写域名，默认使用 HTTP。是否强制启用 HTTPS? [y/N]: " https_choice
+        if [[ "$https_choice" =~ ^[yY]$ ]]; then
+            use_https="true"
+            _warn "未使用域名时启用 HTTPS 需要证书，否则客户端可能遇到证书错误或访问异常"
+        fi
+    fi
     
     # 生成订阅文件
     generate_sub_files

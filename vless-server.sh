@@ -14175,8 +14175,8 @@ $all_proxy_names
   - name: "全球代理"
     type: select
     proxies:
-      - "手动切换"
       - "自动选择"
+      - "手动切换"
 $proxy_select_all
   - name: "自动选择"
     type: url-test
@@ -14189,12 +14189,12 @@ $groups
   - name: 流媒体
     type: select
     proxies:
+      - 自动选择
+      - 手动切换
 $([[ " ${country_list[*]} " == *" US "* ]] && echo "      - US")
 $([[ " ${country_list[*]} " == *" DE "* ]] && echo "      - DE")
 $([[ " ${country_list[*]} " == *" GB "* ]] && echo "      - GB")
 $([[ " ${country_list[*]} " == *" NL "* ]] && echo "      - NL")
-      - 手动切换
-      - 自动选择
       - DIRECT
 
   - name: DNS_Proxy
@@ -14207,43 +14207,43 @@ $([[ " ${country_list[*]} " == *" NL "* ]] && echo "      - NL")
   - name: Telegram
     type: select
     proxies:
+      - 自动选择
+      - 手动切换
 $([[ " ${country_list[*]} " == *" US "* ]] && echo "      - US")
 $([[ " ${country_list[*]} " == *" DE "* ]] && echo "      - DE")
 $([[ " ${country_list[*]} " == *" GB "* ]] && echo "      - GB")
 $([[ " ${country_list[*]} " == *" NL "* ]] && echo "      - NL")
-      - 手动切换
-      - 自动选择
 
   - name: Google
     type: select
     proxies:
+      - 自动选择
+      - 手动切换
 $([[ " ${country_list[*]} " == *" US "* ]] && echo "      - US")
 $([[ " ${country_list[*]} " == *" DE "* ]] && echo "      - DE")
 $([[ " ${country_list[*]} " == *" GB "* ]] && echo "      - GB")
 $([[ " ${country_list[*]} " == *" NL "* ]] && echo "      - NL")
-      - 手动切换
-      - 自动选择
 
   - name: GitHub
     type: select
     proxies:
+      - 自动选择
+      - 手动切换
 $([[ " ${country_list[*]} " == *" US "* ]] && echo "      - US")
 $([[ " ${country_list[*]} " == *" DE "* ]] && echo "      - DE")
 $([[ " ${country_list[*]} " == *" GB "* ]] && echo "      - GB")
 $([[ " ${country_list[*]} " == *" NL "* ]] && echo "      - NL")
-      - 手动切换
-      - 自动选择
 
 
   - name: AI相关
     type: select
     proxies:
+      - 自动选择
+      - 手动切换
 $([[ " ${country_list[*]} " == *" US "* ]] && echo "      - US")
 $([[ " ${country_list[*]} " == *" DE "* ]] && echo "      - DE")
 $([[ " ${country_list[*]} " == *" GB "* ]] && echo "      - GB")
 $([[ " ${country_list[*]} " == *" NL "* ]] && echo "      - NL")
-      - 手动切换
-      - 自动选择
 
   - name: 本地直连
     type: select
@@ -14428,6 +14428,7 @@ rules:
   - RULE-SET,Disney,流媒体
   - RULE-SET,proxy,全球代理
   - RULE-SET,gfw,全球代理
+  - RULE-SET,tld-not-cn,全球代理
   - RULE-SET,applications,本地直连
   - RULE-SET,ChinaMaxDomain,本地直连
   - RULE-SET,ChinaMaxIPNoIPv6,本地直连,no-resolve

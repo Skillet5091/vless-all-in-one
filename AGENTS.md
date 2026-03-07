@@ -12,7 +12,7 @@
 ## 2. Clash/Mihomo 订阅生成规则
 
 1. `rule-providers` 中凡是 `Loyalsoldier/*.txt` 规则源，必须显式加：
-   `format: text`
+   `format: yaml`（这些链接当前返回 `payload:` YAML，不是纯文本）
 2. 生成外部节点（`external_link_to_clash`）时，禁止输出空值或 `null` 字段（旧内核会崩溃/判格式错误），尤其是：
    `flow:`、`servername:`、`public-key: null`、`short-id: null`、`sni:`
 3. `vless + reality` 仅在 `publicKey` 非空时输出 `reality-opts`。

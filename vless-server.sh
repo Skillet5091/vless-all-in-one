@@ -10533,7 +10533,8 @@ show_single_protocol_info() {
             echo -e "  SNI: ${G}$sni${NC}  ShortID: ${G}$short_id${NC}"
             echo -e "  Path: ${G}$path${NC}"
             echo ""
-            echo -e "  ${D}注: Loon/Surge 暂不支持 XHTTP 传输，请使用分享链接导入 Shadowrocket${NC}"
+            echo -e "  ${D}注: Mihomo/Clash.Meta 与 Sing-box 暂不支持 XHTTP 传输${NC}"
+            echo -e "  ${D}请使用 Xray 系客户端（如 v2rayN / NekoBox / Shadowrocket）导入分享链接${NC}"
             ;;
         vless-vision)
             echo -e "  UUID: ${G}$uuid${NC}"
@@ -13266,6 +13267,10 @@ external_link_to_clash() {
             local path=$(echo "$json" | jq -r '.path // empty')
             [[ -z "$uuid" ]] && return
             [[ -z "$transport" ]] && transport="tcp"
+            transport=$(echo "$transport" | tr '[:upper:]' '[:lower:]')
+
+            # Mihomo 当前不支持 xhttp 传输，避免生成失效节点
+            [[ "$transport" == "xhttp" ]] && return
             
             # 兼容旧版 Clash.Meta：避免输出空值/null 字段
             if [[ "$security" == "reality" && -n "$pbk" ]]; then
@@ -13934,22 +13939,8 @@ gen_clash_sub() {
     client-fingerprint: chrome"
                 ;;
             vless-xhttp)
-                [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
-    type: vless
-    server: \"$server_ip\"
-    port: $actual_port
-    uuid: $uuid
-    network: xhttp
-    tls: true
-    udp: true
-    servername: $sni
-    xhttp-opts:
-      path: $path
-      mode: auto
-    reality-opts:
-      public-key: $public_key
-      short-id: $short_id
-    client-fingerprint: chrome"
+                # Mihomo 不支持 xhttp，跳过该节点避免导入后协议失效
+                continue
                 ;;
             vless-ws)
                 [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
@@ -14581,7 +14572,7 @@ gen_singbox_sub() {
         local outbound=""
         
         case "$protocol" in
-            vless|vless-xhttp)
+            vless)
                 [[ -z "$server_ip" ]] && continue
                 outbound=$(cat <<SINGBOX_VLESS_REALITY
     {
@@ -14600,6 +14591,10 @@ gen_singbox_sub() {
     }
 SINGBOX_VLESS_REALITY
 )
+                ;;
+            vless-xhttp)
+                # Sing-box 当前无 xhttp 传输，跳过该节点避免生成错误配置
+                continue
                 ;;
             vless-vision)
                 [[ -z "$server_ip" ]] && continue
@@ -14721,6 +14716,10 @@ SINGBOX_SS
     done
     
     # 输出完整的 Sing-box 配置
+    local outbounds_block="$outbounds,"
+    [[ -z "$outbounds" ]] && outbounds_block=""
+    [[ -z "$selectors" ]] && selectors="\"direct\""
+
     cat <<EOF
 {
   "outbounds": [
@@ -14729,7 +14728,7 @@ SINGBOX_SS
       "tag": "proxy",
       "outbounds": [$selectors]
     },
-$outbounds,
+$outbounds_block
     {
       "type": "direct",
       "tag": "direct"

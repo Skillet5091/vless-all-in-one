@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.4.13[服务端]
+#  多协议代理一键部署脚本 v3.4.14[服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -20,7 +20,7 @@
 
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.4.13"
+readonly VERSION="3.4.14"
 readonly AUTHOR="Skillet5091"
 readonly REPO_URL="https://github.com/Skillet5091/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -15125,7 +15125,23 @@ setup_subscription_interactive() {
         read -rp "  未填写域名，默认使用 HTTP。是否强制启用 HTTPS? [y/N]: " https_choice
         if [[ "$https_choice" =~ ^[yY]$ ]]; then
             use_https="true"
-            _warn "未使用域名时启用 HTTPS 需要证书，否则客户端可能遇到证书错误或访问异常"
+        fi
+    fi
+
+    # 订阅证书配置：仅在启用 HTTPS 时进入
+    if [[ "$use_https" == "true" ]]; then
+        local cert_domain_result=""
+        if [[ -n "$sub_domain" ]]; then
+            cert_domain_result=$(ask_cert_config "$sub_domain" "subscription")
+        else
+            cert_domain_result=$(ask_cert_config "$(gen_sni)" "subscription")
+        fi
+        [[ -n "$cert_domain_result" ]] && sub_domain="$cert_domain_result"
+
+        if [[ -z "$sub_domain" ]]; then
+            _warn "当前订阅 HTTPS 将使用自签证书；客户端可能需要允许不安全证书或跳过证书校验"
+        else
+            _ok "订阅 HTTPS 将使用域名证书: $sub_domain"
         fi
     fi
     

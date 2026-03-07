@@ -2926,8 +2926,13 @@ create_fake_website() {
         fi
     fi
     
-    # 如果仍然没有有效域名，使用默认值
-    [[ -z "$domain" || "$domain" == "config-only" || "$domain" == "vless-server" ]] && domain="localhost"
+    # 如果仍然没有有效域名，优先使用公网 IP，最后才回退 localhost
+    if [[ -z "$domain" || "$domain" == "config-only" || "$domain" == "vless-server" ]]; then
+        local fallback_ip=""
+        fallback_ip=$(get_ipv4 2>/dev/null || true)
+        [[ -z "$fallback_ip" ]] && fallback_ip=$(get_ipv6 2>/dev/null || true)
+        [[ -n "$fallback_ip" ]] && domain="$fallback_ip" || domain="localhost"
+    fi
     
     # 根据系统确定 nginx 配置目录
     # 优先使用 sites-available 目录，与其他子域名服务保持一致
@@ -14838,9 +14843,14 @@ show_sub_links() {
     local ipv4=$(get_ipv4)
     
     # 计算基础 URL (显式保留所有端口)
+    local display_host="$sub_domain"
+    if [[ -z "$display_host" || "$display_host" == "localhost" || "$display_host" == "config-only" || "$display_host" == "vless-server" ]]; then
+        display_host="$ipv4"
+        [[ -z "$display_host" ]] && display_host=$(get_ipv6)
+    fi
     local port_suffix=":${sub_port}"
-    local http_base="http://${sub_domain:-$ipv4}${port_suffix}/sub/${sub_uuid}"
-    local https_base="https://${sub_domain:-$ipv4}${port_suffix}/sub/${sub_uuid}"
+    local http_base="http://${display_host}${port_suffix}/sub/${sub_uuid}"
+    local https_base="https://${display_host}${port_suffix}/sub/${sub_uuid}"
     
     _header
     echo -e "  ${W}订阅服务地址${NC}"

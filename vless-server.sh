@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.4.10[服务端]
+#  多协议代理一键部署脚本 v3.4.11[服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -20,7 +20,7 @@
 
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.4.10"
+readonly VERSION="3.4.11"
 readonly AUTHOR="Skillet5091"
 readonly REPO_URL="https://github.com/Skillet5091/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -10911,7 +10911,13 @@ show_single_protocol_info() {
             source "$CFG/sub.info"
             local sub_protocol="http"
             [[ "$sub_https" == "true" ]] && sub_protocol="https"
-            local base_url="${sub_protocol}://${sub_domain:-$ipv4}:${sub_port}/sub/${sub_uuid}"
+            local display_host="${sub_domain:-$ipv4}"
+            if [[ -z "$display_host" || "$display_host" == "localhost" || "$display_host" == "config-only" || "$display_host" == "vless-server" ]]; then
+                display_host="$ipv4"
+                [[ -z "$display_host" ]] && display_host=$(get_ipv6)
+            fi
+            [[ "$display_host" == *:* ]] && display_host="[$display_host]"
+            local base_url="${sub_protocol}://${display_host}:${sub_port}/sub/${sub_uuid}"
             echo -e "  ${Y}Clash/Clash Verge:${NC}"
             echo -e "  ${G}$base_url/clash${NC}"
         elif [[ "$web_service_running" == "true" ]]; then
@@ -14848,6 +14854,7 @@ show_sub_links() {
         display_host="$ipv4"
         [[ -z "$display_host" ]] && display_host=$(get_ipv6)
     fi
+    [[ "$display_host" == *:* ]] && display_host="[$display_host]"
     local port_suffix=":${sub_port}"
     local http_base="http://${display_host}${port_suffix}/sub/${sub_uuid}"
     local https_base="https://${display_host}${port_suffix}/sub/${sub_uuid}"

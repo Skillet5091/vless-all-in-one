@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.4.11[服务端]
+#  多协议代理一键部署脚本 v3.4.12[服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -20,7 +20,7 @@
 
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.4.11"
+readonly VERSION="3.4.12"
 readonly AUTHOR="Skillet5091"
 readonly REPO_URL="https://github.com/Skillet5091/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -10920,6 +10920,9 @@ show_single_protocol_info() {
             local base_url="${sub_protocol}://${display_host}:${sub_port}/sub/${sub_uuid}"
             echo -e "  ${Y}Clash/Clash Verge:${NC}"
             echo -e "  ${G}$base_url/clash${NC}"
+            if [[ "$sub_https" == "true" ]]; then
+                _info "当前订阅端口为 HTTPS，仅可使用 https:// 链接访问"
+            fi
         elif [[ "$web_service_running" == "true" ]]; then
             echo -e "  ${Y}订阅服务未配置，请在主菜单选择「订阅管理」进行配置${NC}"
         else
@@ -14862,23 +14865,27 @@ show_sub_links() {
     _header
     echo -e "  ${W}订阅服务地址${NC}"
     _line
-    
+
     echo -e "  ${C}当前订阅端口: ${sub_port}${NC}"
-    echo -e "  ${C}支持协议: HTTP / HTTPS${NC}"
-    
-    echo ""
-    echo -e "  ${Y}HTTPS 订阅链接 (推荐):${NC}"
-    echo -e "  - Clash:   ${G}${https_base}/clash${NC}"
-    echo -e "  - Singbox: ${G}${https_base}/singbox${NC}"
-    echo -e "  - V2Ray:   ${G}${https_base}/v2ray${NC}"
-    echo -e "  - Surge:   ${G}${https_base}/surge${NC}"
-    
-    echo ""
-    echo -e "  ${Y}HTTP 订阅链接:${NC}"
-    echo -e "  - Clash:   ${D}${http_base}/clash${NC}"
-    echo -e "  - Singbox: ${D}${http_base}/singbox${NC}"
-    echo -e "  - V2Ray:   ${D}${http_base}/v2ray${NC}"
-    echo -e "  - Surge:   ${D}${http_base}/surge${NC}"
+    if [[ "$sub_https" == "true" ]]; then
+        echo -e "  ${C}当前协议: HTTPS${NC}"
+        echo ""
+        echo -e "  ${Y}HTTPS 订阅链接 (推荐):${NC}"
+        echo -e "  - Clash:   ${G}${https_base}/clash${NC}"
+        echo -e "  - Singbox: ${G}${https_base}/singbox${NC}"
+        echo -e "  - V2Ray:   ${G}${https_base}/v2ray${NC}"
+        echo -e "  - Surge:   ${G}${https_base}/surge${NC}"
+        echo ""
+        _warn "当前订阅端口启用了 HTTPS，请勿使用 HTTP 访问，否则会出现 400 Bad Request"
+    else
+        echo -e "  ${C}当前协议: HTTP${NC}"
+        echo ""
+        echo -e "  ${Y}HTTP 订阅链接:${NC}"
+        echo -e "  - Clash:   ${D}${http_base}/clash${NC}"
+        echo -e "  - Singbox: ${D}${http_base}/singbox${NC}"
+        echo -e "  - V2Ray:   ${D}${http_base}/v2ray${NC}"
+        echo -e "  - Surge:   ${D}${http_base}/surge${NC}"
+    fi
     _line
     
     # 额外提示

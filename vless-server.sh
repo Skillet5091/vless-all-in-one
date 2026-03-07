@@ -13313,24 +13313,6 @@ $sni_line    ws-opts:
       headers:
         Host: $ws_host
 EOF
-            elif [[ "$transport" == "xhttp" ]]; then
-                local xhttp_path="${path:-/}"
-                local sni_line=""
-                [[ -n "$sni" ]] && sni_line="    servername: $sni"$'\n'
-                cat << EOF
-  - name: "$name"
-    type: vless
-    server: "$server"
-    port: $port
-    uuid: $uuid
-    network: xhttp
-    tls: true
-    udp: true
-    skip-cert-verify: true
-$sni_line    xhttp-opts:
-      path: $xhttp_path
-      mode: auto
-EOF
             else
                 local sni_line=""
                 [[ -n "$sni" ]] && sni_line="    servername: $sni"$'\n'

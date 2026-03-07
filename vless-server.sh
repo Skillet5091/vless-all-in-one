@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.4.9[服务端]
+#  多协议代理一键部署脚本 v3.4.10[服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -20,7 +20,7 @@
 
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.4.9"
+readonly VERSION="3.4.10"
 readonly AUTHOR="Skillet5091"
 readonly REPO_URL="https://github.com/Skillet5091/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -2060,6 +2060,23 @@ _warn()  { echo -e "  ${Y}!${NC} $1"; _log "WARN" "$1"; }
 _item()  { echo -e "  ${G}$1${NC}) $2"; }
 _pause() { echo ""; read -rp "  按回车继续..."; }
 
+_cleanup_temp() {
+    local paths=(
+        "/tmp/acme.sh"
+        "/tmp/acme_dns.log"
+        "/tmp/acme_manual.log"
+        "/tmp/acme_output.log"
+        "/tmp/wgcf-account.toml"
+        "/tmp/wgcf-profile.conf"
+        "/tmp/xray_config_test.json"
+        "/tmp/svc_error.log"
+    )
+    local p
+    for p in "${paths[@]}"; do
+        [[ -e "$p" ]] && rm -rf -- "$p" 2>/dev/null || true
+    done
+}
+
 # URL 解码函数 (处理 %XX 编码的中文等字符)
 urldecode() {
     local encoded="$1"
@@ -2701,9 +2718,8 @@ server {
 # 订阅服务 (本地回落 + 公网HTTP/HTTPS)
 server {
     listen 127.0.0.1:${fb_port};
-    listen ${nginx_port} ssl;
-    listen [::]:${nginx_port} ssl;
-    http2 on;
+    listen ${nginx_port} ssl http2;
+    listen [::]:${nginx_port} ssl http2;
     server_name ${domain};
     
     # SSL 证书 (独立域名存放，防止覆盖错串)

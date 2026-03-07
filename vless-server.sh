@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.4.14[服务端]
+#  多协议代理一键部署脚本 v3.4.15[服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -20,7 +20,7 @@
 
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.4.14"
+readonly VERSION="3.4.15"
 readonly AUTHOR="Skillet5091"
 readonly REPO_URL="https://github.com/Skillet5091/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -14775,9 +14775,71 @@ generate_sub_files() {
 }
 
 # 配置 Nginx 订阅服务 (统一格式：80重定向+订阅端口双监听)
+subscription_cert_available() {
+    local domain="${1:-}"
+    local cert_file=""
+    local key_file=""
+
+    if [[ -n "$domain" && -f "$CFG/certs/${domain}.crt" && -f "$CFG/certs/${domain}.key" ]]; then
+        cert_file="$CFG/certs/${domain}.crt"
+        key_file="$CFG/certs/${domain}.key"
+    elif [[ -f "$CFG/certs/server.crt" && -f "$CFG/certs/server.key" ]]; then
+        cert_file="$CFG/certs/server.crt"
+        key_file="$CFG/certs/server.key"
+    else
+        return 1
+    fi
+
+    [[ -s "$cert_file" && -s "$key_file" ]]
+}
+
+configure_subscription_certificate() {
+    local current_domain="${1:-}"
+    local resolved_domain="$current_domain"
+
+    echo ""
+    _line
+    echo -e "  ${W}订阅证书配置${NC}"
+    _item "1" "自动检测现有证书并刷新"
+    _item "2" "安装/更新自签名证书"
+    _item "3" "配置域名证书 (Let's Encrypt / 证书模式选择)"
+    _item "0" "取消"
+    _line
+
+    local choice=""
+    read -rp "  请选择 [0-3]: " choice
+    case "$choice" in
+        1)
+            ;;
+        2)
+            gen_self_cert "${current_domain:-$(gen_sni)}"
+            _ok "已生成/更新自签名证书"
+            ;;
+        3)
+            local cert_domain_result=""
+            if [[ -n "$current_domain" ]]; then
+                cert_domain_result=$(ask_cert_config "$current_domain" "subscription")
+            else
+                cert_domain_result=$(ask_cert_config "$(gen_sni)" "subscription")
+            fi
+            [[ -n "$cert_domain_result" ]] && resolved_domain="$cert_domain_result"
+            ;;
+        0|"")
+            return 1
+            ;;
+        *)
+            _err "无效选择"
+            return 1
+            ;;
+    esac
+
+    printf '%s\n' "$resolved_domain"
+    return 0
+}
+
 setup_nginx_sub() {
     local sub_uuid=$(get_sub_uuid)
-    local sub_port="${1:-2096}" domain="${2:-}" use_https="${3:-true}"
+    local sub_port="${1:-2096}" domain="${2:-}" use_https="${3:-auto}"
 
     # 校验域名有效性，无效值回退到证书域名
     if [[ -z "$domain" || "$domain" == "config-only" || "$domain" == "vless-server" || "$domain" == "_" ]]; then
@@ -14809,14 +14871,19 @@ setup_nginx_sub() {
     # 清理旧配置
     cleanup_nginx_configs "$conf_name"
 
+    # 自动决定当前订阅端口是否启用 HTTPS
+    if [[ "$use_https" == "auto" ]]; then
+        if subscription_cert_available "$domain"; then
+            use_https="true"
+        else
+            use_https="false"
+        fi
+    fi
+
     # 证书检查
     local cert_file="$CFG/certs/server.crt" key_file="$CFG/certs/server.key"
     if [[ "$use_https" == "true" && ( ! -f "$cert_file" || ! -f "$key_file" ) ]]; then
-        _warn "证书不存在，生成自签名证书..."
-        gen_self_cert "${domain:-localhost}"
-    fi
-    if [[ "$use_https" == "true" && ( ! -f "$cert_file" || ! -f "$key_file" ) ]]; then
-        _warn "证书仍不存在，切换到 HTTP 模式..."
+        _warn "证书不存在，切换到 HTTP 模式..."
         use_https="false"
     fi
 
@@ -14867,24 +14934,29 @@ show_sub_links() {
     _line
 
     echo -e "  ${C}当前订阅端口: ${sub_port}${NC}"
+    echo -e "  ${C}当前生效协议: $([[ "$sub_https" == "true" ]] && echo HTTPS || echo HTTP)${NC}"
+    echo ""
+    echo -e "  ${Y}HTTPS 订阅链接:${NC}"
+    echo -e "  - Clash:   ${G}${https_base}/clash${NC}"
+    echo -e "  - Singbox: ${G}${https_base}/singbox${NC}"
+    echo -e "  - V2Ray:   ${G}${https_base}/v2ray${NC}"
+    echo -e "  - Surge:   ${G}${https_base}/surge${NC}"
     if [[ "$sub_https" == "true" ]]; then
-        echo -e "  ${C}当前协议: HTTPS${NC}"
-        echo ""
-        echo -e "  ${Y}HTTPS 订阅链接 (推荐):${NC}"
-        echo -e "  - Clash:   ${G}${https_base}/clash${NC}"
-        echo -e "  - Singbox: ${G}${https_base}/singbox${NC}"
-        echo -e "  - V2Ray:   ${G}${https_base}/v2ray${NC}"
-        echo -e "  - Surge:   ${G}${https_base}/surge${NC}"
-        echo ""
-        _warn "当前订阅端口启用了 HTTPS，请勿使用 HTTP 访问，否则会出现 400 Bad Request"
+        _ok "当前端口已启用 HTTPS，可直接使用以上链接"
     else
-        echo -e "  ${C}当前协议: HTTP${NC}"
-        echo ""
-        echo -e "  ${Y}HTTP 订阅链接:${NC}"
-        echo -e "  - Clash:   ${D}${http_base}/clash${NC}"
-        echo -e "  - Singbox: ${D}${http_base}/singbox${NC}"
-        echo -e "  - V2Ray:   ${D}${http_base}/v2ray${NC}"
-        echo -e "  - Surge:   ${D}${http_base}/surge${NC}"
+        _warn "当前端口未启用 HTTPS；以上 HTTPS 链接仅在安装证书并刷新 Nginx 后可用"
+    fi
+
+    echo ""
+    echo -e "  ${Y}HTTP 订阅链接:${NC}"
+    echo -e "  - Clash:   ${D}${http_base}/clash${NC}"
+    echo -e "  - Singbox: ${D}${http_base}/singbox${NC}"
+    echo -e "  - V2Ray:   ${D}${http_base}/v2ray${NC}"
+    echo -e "  - Surge:   ${D}${http_base}/surge${NC}"
+    if [[ "$sub_https" == "true" ]]; then
+        _warn "当前端口处于 HTTPS 模式，请勿使用上述 HTTP 链接访问"
+    else
+        _ok "当前端口已启用 HTTP，可直接使用以上链接"
     fi
     _line
     
@@ -14917,7 +14989,8 @@ manage_subscription() {
             _item "4" "修改订阅端口 (当前: ${G}${sub_port}${NC})"
             _item "5" "回落端口管理 (当前: $(cat "$CFG/fallback_port" 2>/dev/null || echo "8443"))"
             _item "6" "手动刷新 Nginx 配置"
-            _item "7" "停用订阅服务"
+            _item "7" "配置订阅证书 (域名证书 / 自签证书)"
+            _item "8" "停用订阅服务"
         else
             echo -e "  状态: ${D}未配置${NC}"
             echo ""
@@ -14976,14 +15049,45 @@ EOF
                         source "$CFG/sub.info"
                         refresh_port="${sub_port}"
                     }
-                    create_fake_website "$sub_domain" "config-only" "$refresh_port"
-                    # 联动更新核心服务配置并重启
-                    rebuild_and_reload_xray "silent"
-                    rebuild_and_reload_singbox "silent"
-                    _ok "Nginx 订阅服务已刷新，核心服务已重载"
+                    if setup_nginx_sub "$refresh_port" "$sub_domain" "auto"; then
+                        local actual_https="false"
+                        subscription_cert_available "$sub_domain" && actual_https="true"
+                        cat > "$CFG/sub.info" << EOF
+sub_uuid=$sub_uuid
+sub_port=$refresh_port
+sub_domain=$sub_domain
+sub_https=$actual_https
+EOF
+                        rebuild_and_reload_xray "silent"
+                        rebuild_and_reload_singbox "silent"
+                        _ok "Nginx 订阅服务已按当前证书状态刷新，核心服务已重载"
+                    else
+                        _err "Nginx 刷新失败"
+                    fi
                     _pause 
                     ;;
-                7) 
+                7)
+                    local new_domain=""
+                    new_domain=$(configure_subscription_certificate "$sub_domain") || { _pause; continue; }
+                    [[ -n "$new_domain" ]] && sub_domain="$new_domain"
+                    if setup_nginx_sub "$sub_port" "$sub_domain" "auto"; then
+                        local actual_https="false"
+                        subscription_cert_available "$sub_domain" && actual_https="true"
+                        cat > "$CFG/sub.info" << EOF
+sub_uuid=$sub_uuid
+sub_port=$sub_port
+sub_domain=$sub_domain
+sub_https=$actual_https
+EOF
+                        rebuild_and_reload_xray "silent"
+                        rebuild_and_reload_singbox "silent"
+                        _ok "订阅证书配置已应用，Nginx 已刷新"
+                    else
+                        _err "订阅证书配置失败"
+                    fi
+                    _pause
+                    ;;
+                8) 
                     # 彻底清理所有可能的 Nginx 配置路径
                     if [[ -f "$CFG/sub.info" ]]; then
                         local s_uuid="" s_port="" s_domain="" s_https=""
@@ -15115,34 +15219,14 @@ setup_subscription_interactive() {
     echo -e "  ${D}留空使用服务器IP${NC}"
     read -rp "  域名 (可选): " sub_domain
 
-    # HTTPS：无域名时默认关闭；有域名时默认开启
-    local use_https="false"
-    if [[ -n "$sub_domain" ]]; then
+    # 自动按证书状态决定当前订阅端口使用 HTTP 或 HTTPS
+    local use_https="auto"
+    if subscription_cert_available "$sub_domain"; then
         use_https="true"
-        read -rp "  启用 HTTPS? [Y/n]: " https_choice
-        [[ "$https_choice" =~ ^[nN]$ ]] && use_https="false"
+        _ok "检测到可用证书，当前订阅端口将默认启用 HTTPS"
     else
-        read -rp "  未填写域名，默认使用 HTTP。是否强制启用 HTTPS? [y/N]: " https_choice
-        if [[ "$https_choice" =~ ^[yY]$ ]]; then
-            use_https="true"
-        fi
-    fi
-
-    # 订阅证书配置：仅在启用 HTTPS 时进入
-    if [[ "$use_https" == "true" ]]; then
-        local cert_domain_result=""
-        if [[ -n "$sub_domain" ]]; then
-            cert_domain_result=$(ask_cert_config "$sub_domain" "subscription")
-        else
-            cert_domain_result=$(ask_cert_config "$(gen_sni)" "subscription")
-        fi
-        [[ -n "$cert_domain_result" ]] && sub_domain="$cert_domain_result"
-
-        if [[ -z "$sub_domain" ]]; then
-            _warn "当前订阅 HTTPS 将使用自签证书；客户端可能需要允许不安全证书或跳过证书校验"
-        else
-            _ok "订阅 HTTPS 将使用域名证书: $sub_domain"
-        fi
+        use_https="false"
+        _warn "未检测到可用证书，当前订阅端口将默认使用 HTTP"
     fi
     
     # 生成订阅文件
@@ -15162,13 +15246,16 @@ setup_subscription_interactive() {
         _pause
         return 1
     fi
-    
+
+    local actual_https="false"
+    subscription_cert_available "$sub_domain" && actual_https="true"
+
     # 保存订阅信息到 sub.info (保持原有逻辑兼容)
     cat > "$CFG/sub.info" << EOF
 sub_uuid=$sub_uuid
 sub_port=$sub_port
 sub_domain=$sub_domain
-sub_https=$use_https
+sub_https=$actual_https
 EOF
     
     echo ""

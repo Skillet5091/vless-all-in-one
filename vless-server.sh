@@ -1724,6 +1724,7 @@ add_xray_inbound_v2() {
     local short_id=$(echo "$cfg" | jq -r '.short_id // empty')
     local private_key=$(echo "$cfg" | jq -r '.private_key // empty')
     local path=$(echo "$cfg" | jq -r '.path // empty')
+    local outer_port=$(echo "$cfg" | jq -r '.outer_port // empty')
     local password=$(echo "$cfg" | jq -r '.password // empty')
     local username=$(echo "$cfg" | jq -r '.username // empty')
     local method=$(echo "$cfg" | jq -r '.method // empty')
@@ -1732,9 +1733,15 @@ add_xray_inbound_v2() {
     
     # 检测主协议和回落配置
     local has_master=false
-    db_exists "xray" "vless-vision" && has_master=true
-    db_exists "xray" "vless" && has_master=true
-    db_exists "xray" "trojan" && has_master=true
+    _has_master_protocol && has_master=true
+    
+    # WS/VMess-WS 是否作为回落子协议运行
+    local use_fallback_mode=false
+    if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" ]]; then
+        if [[ "$has_master" == "true" && -n "$outer_port" && "$outer_port" != "$port" ]]; then
+            use_fallback_mode=true
+        fi
+    fi
     
     # 读取回落端口 (与 create_fake_website 逻辑对齐)
     local fb_port="8443"
@@ -1742,25 +1749,27 @@ add_xray_inbound_v2() {
     
     # 构建回落数组 (默认指向回落端口)
     local fallbacks=$(jq -n --arg port "$fb_port" '[{"dest":"127.0.0.1:\($port)","xver":0}]')
-    local ws_port="" ws_path="" vmess_port="" vmess_path=""
+    local ws_port="" ws_path="" ws_outer_port="" vmess_port="" vmess_path="" vmess_outer_port=""
     
     # 检查 vless-ws 回落
     if db_exists "xray" "vless-ws"; then
         ws_port=$(db_get_field "xray" "vless-ws" "port")
         ws_path=$(db_get_field "xray" "vless-ws" "path")
+        ws_outer_port=$(db_get_field "xray" "vless-ws" "outer_port")
     fi
     
     # 检查 vmess-ws 回落
     if db_exists "xray" "vmess-ws"; then
         vmess_port=$(db_get_field "xray" "vmess-ws" "port")
         vmess_path=$(db_get_field "xray" "vmess-ws" "path")
+        vmess_outer_port=$(db_get_field "xray" "vmess-ws" "outer_port")
     fi
     
     # 使用 jq 构建回落数组
-    if [[ -n "$ws_port" && -n "$ws_path" ]]; then
+    if [[ -n "$ws_port" && -n "$ws_path" && -n "$ws_outer_port" && "$ws_outer_port" != "$ws_port" ]]; then
         fallbacks=$(echo "$fallbacks" | jq --arg p "$ws_path" --argjson d "$ws_port" '. += [{"path":$p,"dest":$d,"xver":0}]')
     fi
-    if [[ -n "$vmess_port" && -n "$vmess_path" ]]; then
+    if [[ -n "$vmess_port" && -n "$vmess_path" && -n "$vmess_outer_port" && "$vmess_outer_port" != "$vmess_port" ]]; then
         fallbacks=$(echo "$fallbacks" | jq --arg p "$vmess_path" --argjson d "$vmess_port" '. += [{"path":$p,"dest":$d,"xver":0}]')
     fi
     
@@ -1831,7 +1840,7 @@ add_xray_inbound_v2() {
             }' > "$tmp_inbound"
             ;;
         vless-ws)
-            if [[ "$has_master" == "true" ]]; then
+            if [[ "$use_fallback_mode" == "true" ]]; then
                 # 回落模式：监听本地
                 jq -n \
                     --argjson port "$port" \
@@ -1911,7 +1920,7 @@ add_xray_inbound_v2() {
             }' > "$tmp_inbound"
             ;;
         vmess-ws)
-            if [[ "$has_master" == "true" ]]; then
+            if [[ "$use_fallback_mode" == "true" ]]; then
                 jq -n \
                     --argjson port "$port" \
                     --arg uuid "$uuid" \
@@ -10467,6 +10476,7 @@ show_single_protocol_info() {
     local hop_start=$(echo "$cfg" | jq -r '.hop_start // empty')
     local hop_end=$(echo "$cfg" | jq -r '.hop_end // empty')
     local stls_password=$(echo "$cfg" | jq -r '.stls_password // empty')
+    local outer_port=$(echo "$cfg" | jq -r '.outer_port // empty')
     
     # 重新获取 IP（数据库中的可能是旧的）
     [[ -z "$ipv4" ]] && ipv4=$(get_ipv4)
@@ -10477,27 +10487,16 @@ show_single_protocol_info() {
     local is_fallback_protocol=false
     local master_name=""
     if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" ]]; then
-        # 检查是否有主协议 (Vision/Trojan/Reality)
-        if db_exists "xray" "vless-vision"; then
-            local master_port=$(db_get_field "xray" "vless-vision" "port")
-            if [[ -n "$master_port" ]]; then
-                display_port="$master_port"
-                is_fallback_protocol=true
+        # 仅当 outer_port 与内部端口不同，才判定为回落模式
+        if [[ -n "$outer_port" && "$outer_port" != "$port" ]]; then
+            display_port="$outer_port"
+            is_fallback_protocol=true
+            if db_exists "xray" "vless-vision"; then
                 master_name="Vision"
-            fi
-        elif db_exists "xray" "trojan"; then
-            local master_port=$(db_get_field "xray" "trojan" "port")
-            if [[ -n "$master_port" ]]; then
-                display_port="$master_port"
-                is_fallback_protocol=true
+            elif db_exists "xray" "trojan"; then
                 master_name="Trojan"
-            fi
-        elif db_exists "xray" "vless"; then
-            local master_port=$(db_get_field "xray" "vless" "port")
-            if [[ -n "$master_port" ]]; then
-                display_port="$master_port"
-                is_fallback_protocol=true
-                master_name="Reality"
+            else
+                master_name="主协议"
             fi
         fi
     fi
@@ -13791,6 +13790,7 @@ gen_v2ray_sub() {
         # 提取字段
         local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
         local port=$(echo "$cfg" | jq -r '.port // empty')
+        local outer_port=$(echo "$cfg" | jq -r '.outer_port // empty')
         local sni=$(echo "$cfg" | jq -r '.sni // empty')
         local short_id=$(echo "$cfg" | jq -r '.short_id // empty')
         local public_key=$(echo "$cfg" | jq -r '.public_key // empty')
@@ -13802,8 +13802,12 @@ gen_v2ray_sub() {
         
         # 对于回落子协议，使用主协议端口
         local actual_port="$port"
-        if [[ -n "$master_port" && ("$protocol" == "vless-ws" || "$protocol" == "vmess-ws") ]]; then
-            actual_port="$master_port"
+        if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" ]]; then
+            if [[ -n "$outer_port" && "$outer_port" != "$port" ]]; then
+                actual_port="$outer_port"
+            elif [[ -n "$master_port" ]]; then
+                actual_port="$master_port"
+            fi
         fi
         
         local link=""
@@ -13904,6 +13908,7 @@ gen_clash_sub() {
         
         local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
         local port=$(echo "$cfg" | jq -r '.port // empty')
+        local outer_port=$(echo "$cfg" | jq -r '.outer_port // empty')
         local sni=$(echo "$cfg" | jq -r '.sni // empty')
         local short_id=$(echo "$cfg" | jq -r '.short_id // empty')
         local public_key=$(echo "$cfg" | jq -r '.public_key // empty')
@@ -13912,8 +13917,12 @@ gen_clash_sub() {
         local method=$(echo "$cfg" | jq -r '.method // empty')
         
         local actual_port="$port"
-        if [[ -n "$master_port" && ("$protocol" == "vless-ws" || "$protocol" == "vmess-ws") ]]; then
-            actual_port="$master_port"
+        if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" ]]; then
+            if [[ -n "$outer_port" && "$outer_port" != "$port" ]]; then
+                actual_port="$outer_port"
+            elif [[ -n "$master_port" ]]; then
+                actual_port="$master_port"
+            fi
         fi
         
         local name="${self_cc}-$(get_protocol_name $protocol)-${ip_suffix}"
@@ -14569,6 +14578,7 @@ gen_singbox_sub() {
         
         local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
         local port=$(echo "$cfg" | jq -r '.port // empty')
+        local outer_port=$(echo "$cfg" | jq -r '.outer_port // empty')
         local sni=$(echo "$cfg" | jq -r '.sni // empty')
         local short_id=$(echo "$cfg" | jq -r '.short_id // empty')
         local public_key=$(echo "$cfg" | jq -r '.public_key // empty')
@@ -14577,8 +14587,12 @@ gen_singbox_sub() {
         local method=$(echo "$cfg" | jq -r '.method // empty')
         
         local actual_port="$port"
-        if [[ -n "$master_port" && ("$protocol" == "vless-ws" || "$protocol" == "vmess-ws") ]]; then
-            actual_port="$master_port"
+        if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" ]]; then
+            if [[ -n "$outer_port" && "$outer_port" != "$port" ]]; then
+                actual_port="$outer_port"
+            elif [[ -n "$master_port" ]]; then
+                actual_port="$master_port"
+            fi
         fi
         
         local name="${country_code}-$(get_protocol_name $protocol)-${ip_suffix}"

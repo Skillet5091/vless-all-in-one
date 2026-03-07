@@ -1875,8 +1875,7 @@ add_xray_inbound_v2() {
                     protocol: "vless",
                     settings: {
                         clients: [{id: $uuid}],
-                        decryption: "none",
-                        fallbacks: $fallbacks
+                        decryption: "none"
                     },
                     streamSettings: {
                         network: "ws",

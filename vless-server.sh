@@ -14797,14 +14797,17 @@ configure_subscription_certificate() {
     local current_domain="${1:-}"
     local resolved_domain="$current_domain"
 
-    echo ""
-    _line
-    echo -e "  ${W}订阅证书配置${NC}"
-    _item "1" "自动检测现有证书并刷新"
-    _item "2" "安装/更新自签名证书"
-    _item "3" "配置域名证书 (Let's Encrypt / 证书模式选择)"
-    _item "0" "取消"
-    _line
+    # 注意：该函数会被命令替换调用，交互输出必须走 stderr，stdout 仅返回域名结果
+    {
+        echo ""
+        _line
+        echo -e "  ${W}订阅证书配置${NC}"
+        _item "1" "自动检测现有证书并刷新"
+        _item "2" "安装/更新自签名证书"
+        _item "3" "配置域名证书 (Let's Encrypt / 证书模式选择)"
+        _item "0" "取消"
+        _line
+    } >&2
 
     local choice=""
     read -rp "  请选择 [0-3]: " choice
@@ -14812,8 +14815,8 @@ configure_subscription_certificate() {
         1)
             ;;
         2)
-            gen_self_cert "${current_domain:-$(gen_sni)}"
-            _ok "已生成/更新自签名证书"
+            gen_self_cert "${current_domain:-$(gen_sni)}" >&2
+            _ok "已生成/更新自签名证书" >&2
             ;;
         3)
             local cert_domain_result=""
@@ -14828,7 +14831,7 @@ configure_subscription_certificate() {
             return 1
             ;;
         *)
-            _err "无效选择"
+            _err "无效选择" >&2
             return 1
             ;;
     esac

@@ -9574,7 +9574,7 @@ parse_subscription() {
     local content nodes=()
     
     _info "获取订阅内容..."
-    content=$(curl -sL --connect-timeout 10 "$url" 2>/dev/null)
+    content=$(_fetch_sub_content "$url" 30)
     [[ -z "$content" ]] && { _err "获取订阅失败"; return 1; }
     
     # 尝试 base64 解码
@@ -12695,6 +12695,16 @@ EXTERNAL_LINKS_FILE="$CFG/external_links.txt"
 EXTERNAL_SUBS_FILE="$CFG/external_subs.txt"
 EXTERNAL_CACHE_DIR="$CFG/external_nodes_cache"
 
+# 订阅抓取：默认忽略 TLS 证书校验，兼容自签证书订阅源
+# 如需强制校验证书，可在执行前设置: VLESS_SUB_TLS_VERIFY=true
+_fetch_sub_content() {
+    local url="$1"
+    local max_time="${2:-30}"
+    local -a args=(-sL --connect-timeout 10 --max-time "$max_time")
+    [[ "${VLESS_SUB_TLS_VERIFY:-false}" != "true" ]] && args+=(-k)
+    curl "${args[@]}" "$url" 2>/dev/null
+}
+
 # 解析 host:port 格式（支持 IPv6）
 # 用法: _parse_hostport "hostport_string" 
 # 输出: host|port
@@ -13077,7 +13087,7 @@ get_link_name() {
 # 拉取订阅内容
 fetch_subscription() {
     local url="$1"
-    local content=$(curl -sL --connect-timeout 10 --max-time 30 "$url" 2>/dev/null)
+    local content=$(_fetch_sub_content "$url" 30)
     [[ -z "$content" ]] && return 1
     
     # 尝试 Base64 解码

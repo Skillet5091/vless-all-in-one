@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.4.15[服务端]
+#  多协议代理一键部署脚本 v3.5.0[服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -20,7 +20,7 @@
 
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.4.15"
+readonly VERSION="3.5.0"
 readonly AUTHOR="Skillet5091"
 readonly REPO_URL="https://github.com/Skillet5091/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -7141,6 +7141,69 @@ reconnect_warp_official() {
     return 0
 }
 
+install_warp_auto_rotate() {
+    local interval_min="${1:-15}"
+
+    if ! check_cmd warp-cli; then
+        _err "warp-cli 未安装，无法开启自动切换 IP"
+        return 1
+    fi
+
+    cat > /usr/local/bin/warp-auto-rotate <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+sleep 2
+warp-cli --accept-tos connect >/dev/null 2>&1 || true
+EOF
+    chmod +x /usr/local/bin/warp-auto-rotate
+
+    cat > /etc/systemd/system/warp-auto-rotate.service <<EOF
+[Unit]
+Description=WARP Auto Rotate IP
+After=network-online.target warp-svc.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/warp-auto-rotate
+EOF
+
+    cat > /etc/systemd/system/warp-auto-rotate.timer <<EOF
+[Unit]
+Description=Run WARP auto rotate periodically
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=${interval_min}min
+Unit=warp-auto-rotate.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now warp-auto-rotate.timer >/dev/null 2>&1
+    _ok "WARP 自动切换 IP 已开启 (每 ${interval_min} 分钟)"
+}
+
+uninstall_warp_auto_rotate() {
+    systemctl disable --now warp-auto-rotate.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/warp-auto-rotate.timer
+    rm -f /etc/systemd/system/warp-auto-rotate.service
+    rm -f /usr/local/bin/warp-auto-rotate
+    systemctl daemon-reload
+    _ok "WARP 自动切换 IP 已关闭"
+}
+
+warp_auto_rotate_status() {
+    if systemctl is-active warp-auto-rotate.timer >/dev/null 2>&1; then
+        echo "enabled"
+    else
+        echo "disabled"
+    fi
+}
+
 # 卸载 WARP 官方客户端
 uninstall_warp_official() {
     _info "卸载 WARP 官方客户端..."
@@ -7980,7 +8043,9 @@ manage_warp() {
             _item "1" "切换到 WGCF 模式"
             _item "2" "重新连接官方客户端"
             _item "3" "测试 WARP 连接"
-            _item "4" "卸载官方客户端"
+            _item "4" "开启自动切换 IP (15分钟)"
+            _item "5" "关闭自动切换 IP"
+            _item "6" "卸载官方客户端"
         else
             _item "1" "切换到官方客户端模式"
             _item "2" "重新获取 WGCF 配置"
@@ -8068,12 +8133,36 @@ manage_warp() {
                 _pause
                 ;;
             4)
-                echo ""
-                read -rp "  确认卸载 WARP? [y/N]: " confirm
-                if [[ "$confirm" =~ ^[Yy] ]]; then
-                    uninstall_warp
+                if [[ "$current_mode" == "official" ]]; then
+                    install_warp_auto_rotate 15
+                else
+                    echo ""
+                    read -rp "  确认卸载 WARP? [y/N]: " confirm
+                    if [[ "$confirm" =~ ^[Yy] ]]; then
+                        uninstall_warp
+                    fi
                 fi
                 _pause
+                ;;
+            5)
+                if [[ "$current_mode" == "official" ]]; then
+                    uninstall_warp_auto_rotate
+                    _pause
+                else
+                    _warn "无效选项"
+                fi
+                ;;
+            6)
+                if [[ "$current_mode" == "official" ]]; then
+                    echo ""
+                    read -rp "  确认卸载 WARP? [y/N]: " confirm
+                    if [[ "$confirm" =~ ^[Yy] ]]; then
+                        uninstall_warp
+                    fi
+                    _pause
+                else
+                    _warn "无效选项"
+                fi
                 ;;
             0) return ;;
             *) _warn "无效选项" ;;

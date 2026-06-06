@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.0[服务端]
+#  多协议代理一键部署脚本 v3.6.0[服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -20,7 +20,7 @@
 
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.0"
+readonly VERSION="3.6.0"
 readonly AUTHOR="Skillet5091"
 readonly REPO_URL="https://github.com/Skillet5091/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -4687,7 +4687,27 @@ fix_selinux_context() {
 # 获取 GitHub 最新版本号
 _get_latest_version() {
     local repo="$1"
-    curl -sL "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//'
+    curl -fsSL --connect-timeout "$CURL_TIMEOUT_NORMAL" --max-time 20 \
+        "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null | \
+        jq -r '.tag_name // empty' | sed 's/^v//'
+}
+
+_get_binary_version() {
+    local name="$1"
+    case "$name" in
+        xray)
+            xray version 2>/dev/null | head -n 1 | awk '{print $2}'
+            ;;
+        sing-box)
+            sing-box version 2>/dev/null | awk '/version/ {print $3; exit}'
+            ;;
+        caddy)
+            caddy version 2>/dev/null | awk '{print $1}' | sed 's/^v//'
+            ;;
+        *)
+            "$name" --version 2>/dev/null | head -n 1 | grep -oE 'v?[0-9]+(\.[0-9]+){1,3}([-.][A-Za-z0-9]+)?' | head -n 1 | sed 's/^v//'
+            ;;
+    esac
 }
 
 # 架构映射 (减少重复代码)
@@ -4714,11 +4734,7 @@ _install_binary() {
             _ok "$name 已安装"
             return 0
         fi
-        if [[ "$name" == "xray" ]]; then
-            current_version=$(xray version 2>/dev/null | head -n 1 | awk '{print $2}')
-        elif [[ "$name" == "sing-box" ]]; then
-            current_version=$(sing-box version 2>/dev/null | grep version | awk '{print $3}')
-        fi
+        current_version=$(_get_binary_version "$name")
     fi
     
     _info "安装 $name (获取最新版本)..."
@@ -4739,7 +4755,7 @@ _install_binary() {
     local tmp=$(mktemp -d)
     local url=$(eval echo "$url_pattern")
     
-    if curl -sLo "$tmp/pkg" --connect-timeout 60 "$url"; then
+    if curl -fsSLo "$tmp/pkg" --connect-timeout "$CURL_TIMEOUT_DOWNLOAD" --retry 3 "$url"; then
         eval "$extract_cmd"
         rm -rf "$tmp"
         _ok "$name v$version 已安装"
@@ -5035,7 +5051,8 @@ EOF
 
 # 安装 Snell v4
 install_snell() {
-    check_cmd snell-server && { _ok "Snell 已安装"; return 0; }
+    local force_update="$1"
+    check_cmd snell-server && [[ "$force_update" != "true" ]] && { _ok "Snell 已安装"; return 0; }
     local sarch=$(_map_arch "amd64:aarch64:armv7l") || { _err "不支持的架构"; return 1; }
     # Alpine 需要安装 upx 来解压 UPX 压缩的二进制 (musl 不兼容 UPX stub)
     if [[ "$DISTRO" == "alpine" ]]; then
@@ -5043,7 +5060,7 @@ install_snell() {
     fi
     _info "安装 Snell v4..."
     local tmp=$(mktemp -d)
-    if curl -sLo "$tmp/snell.zip" --connect-timeout 60 "https://dl.nssurge.com/snell/snell-server-v4.1.1-linux-${sarch}.zip"; then
+    if curl -fsSLo "$tmp/snell.zip" --connect-timeout "$CURL_TIMEOUT_DOWNLOAD" --retry 3 "https://dl.nssurge.com/snell/snell-server-v4.1.1-linux-${sarch}.zip"; then
         unzip -oq "$tmp/snell.zip" -d "$tmp/" && install -m 755 "$tmp/snell-server" /usr/local/bin/snell-server
         # Alpine: 解压 UPX 压缩 (Snell 官方二进制使用 UPX，musl 不兼容 UPX stub)
         if [[ "$DISTRO" == "alpine" ]] && command -v upx &>/dev/null; then
@@ -5056,7 +5073,8 @@ install_snell() {
 
 # 安装 Snell v5
 install_snell_v5() {
-    check_cmd snell-server-v5 && { _ok "Snell v5 已安装"; return 0; }
+    local force_update="$1"
+    check_cmd snell-server-v5 && [[ "$force_update" != "true" ]] && { _ok "Snell v5 已安装"; return 0; }
     local sarch=$(_map_arch "amd64:aarch64:armv7l") || { _err "不支持的架构"; return 1; }
     # Alpine 需要安装 upx 来解压 UPX 压缩的二进制 (musl 不兼容 UPX stub)
     if [[ "$DISTRO" == "alpine" ]]; then
@@ -5065,7 +5083,7 @@ install_snell_v5() {
     local version=$(_get_latest_version "surge-networks/snell"); [[ -z "$version" ]] && version="5.0.1"
     _info "安装 Snell v$version..."
     local tmp=$(mktemp -d)
-    if curl -sLo "$tmp/snell.zip" --connect-timeout 60 "https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip"; then
+    if curl -fsSLo "$tmp/snell.zip" --connect-timeout "$CURL_TIMEOUT_DOWNLOAD" --retry 3 "https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip"; then
         unzip -oq "$tmp/snell.zip" -d "$tmp/" && install -m 755 "$tmp/snell-server" /usr/local/bin/snell-server-v5
         # Alpine: 解压 UPX 压缩 (Snell 官方二进制使用 UPX，musl 不兼容 UPX stub)
         if [[ "$DISTRO" == "alpine" ]] && command -v upx &>/dev/null; then
@@ -5078,6 +5096,7 @@ install_snell_v5() {
 
 # 安装 AnyTLS
 install_anytls() {
+    local force_update="$1"
     local aarch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
     # Alpine 需要安装 gcompat 兼容层（以防 Go 二进制使用 CGO）
     if [[ "$DISTRO" == "alpine" ]]; then
@@ -5085,20 +5104,24 @@ install_anytls() {
     fi
     _install_binary "anytls-server" "anytls/anytls-go" \
         'https://github.com/anytls/anytls-go/releases/download/v$version/anytls_${version}_linux_${aarch}.zip' \
-        'unzip -oq "$tmp/pkg" -d "$tmp/" && install -m 755 "$tmp/anytls-server" /usr/local/bin/anytls-server && install -m 755 "$tmp/anytls-client" /usr/local/bin/anytls-client 2>/dev/null'
+        'unzip -oq "$tmp/pkg" -d "$tmp/" && install -m 755 "$tmp/anytls-server" /usr/local/bin/anytls-server && install -m 755 "$tmp/anytls-client" /usr/local/bin/anytls-client 2>/dev/null' \
+        "$force_update"
 }
 
 # 安装 ShadowTLS
 install_shadowtls() {
+    local force_update="$1"
     local aarch=$(_map_arch "x86_64-unknown-linux-musl:aarch64-unknown-linux-musl:armv7-unknown-linux-musleabihf") || { _err "不支持的架构"; return 1; }
     _install_binary "shadow-tls" "ihciah/shadow-tls" \
         'https://github.com/ihciah/shadow-tls/releases/download/v$version/shadow-tls-${aarch}' \
-        'install -m 755 "$tmp/pkg" /usr/local/bin/shadow-tls'
+        'install -m 755 "$tmp/pkg" /usr/local/bin/shadow-tls' \
+        "$force_update"
 }
 
 # 安装 NaïveProxy (Caddy with forwardproxy)
 install_naive() {
-    check_cmd caddy && caddy list-modules 2>/dev/null | grep -q "http.handlers.forward_proxy" && { _ok "NaïveProxy (Caddy) 已安装"; return 0; }
+    local force_update="$1"
+    check_cmd caddy && [[ "$force_update" != "true" ]] && caddy list-modules 2>/dev/null | grep -q "http.handlers.forward_proxy" && { _ok "NaïveProxy (Caddy) 已安装"; return 0; }
     
     local narch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
     # Alpine 需要安装 gcompat 兼容层
@@ -5110,7 +5133,7 @@ install_naive() {
     local tmp=$(mktemp -d)
     
     # 获取 tar.xz 下载链接 (使用 jq 解析 JSON)
-    local download_url=$(curl -sL --connect-timeout "$CURL_TIMEOUT_NORMAL" \
+    local download_url=$(curl -fsSL --connect-timeout "$CURL_TIMEOUT_NORMAL" --max-time 20 \
         "https://api.github.com/repos/klzgrad/forwardproxy/releases/latest" | \
         jq -r '.assets[] | select(.name | endswith(".tar.xz")) | .browser_download_url' 2>/dev/null | head -1)
     
@@ -5121,7 +5144,7 @@ install_naive() {
     fi
     
     _info "下载: $download_url"
-    if curl -fSLo "$tmp/caddy.tar.xz" --connect-timeout 60 --retry 3 "$download_url"; then
+    if curl -fsSLo "$tmp/caddy.tar.xz" --connect-timeout "$CURL_TIMEOUT_DOWNLOAD" --retry 3 "$download_url"; then
         # 解压
         tar -xJf "$tmp/caddy.tar.xz" -C "$tmp/" 2>/dev/null || { _err "解压失败"; rm -rf "$tmp"; return 1; }
         
@@ -6306,7 +6329,7 @@ _auto_update_system_script() {
     fi
 }
 
-# 自动更新核心组件
+# 自动更新 Xray/Sing-box 核心组件
 _auto_update_cores() {
     if [[ ! -f "$CFG/db.json" ]]; then return; fi
     
@@ -6315,31 +6338,34 @@ _auto_update_cores() {
     
     local updated_xray=false
     local updated_singbox=false
+    local new_xray_ver=""
+    local new_singbox_ver=""
     
-    if check_cmd xray && [[ -n $(db_list_protocols "xray") ]]; then
-        local old_ver=$(xray version 2>/dev/null | head -n 1 | awk '{print $2}')
+    if check_cmd xray && { [[ -n $(db_list_protocols "xray") ]] || is_protocol_installed "ss2022-shadowtls"; }; then
+        local old_xray_ver=$(_get_binary_version "xray")
         install_xray "true" >/dev/null 2>&1
-        local new_ver=$(xray version 2>/dev/null | head -n 1 | awk '{print $2}')
-        if [[ "$old_ver" != "$new_ver" && -n "$new_ver" ]]; then
+        new_xray_ver=$(_get_binary_version "xray")
+        if [[ "$old_xray_ver" != "$new_xray_ver" && -n "$new_xray_ver" ]]; then
             updated_xray=true
         fi
     fi
     
-    if check_cmd sing-box && [[ -n $(db_list_protocols "singbox") ]]; then
-        local old_ver=$(sing-box version 2>/dev/null | grep version | awk '{print $3}')
+    if check_cmd sing-box && { is_protocol_installed "hy2" || is_protocol_installed "tuic"; }; then
+        local old_singbox_ver=$(_get_binary_version "sing-box")
         install_singbox "true" >/dev/null 2>&1
-        local new_ver=$(sing-box version 2>/dev/null | grep version | awk '{print $3}')
-        if [[ "$old_ver" != "$new_ver" && -n "$new_ver" ]]; then
+        new_singbox_ver=$(_get_binary_version "sing-box")
+        if [[ "$old_singbox_ver" != "$new_singbox_ver" && -n "$new_singbox_ver" ]]; then
             updated_singbox=true
         fi
     fi
     
     if [[ "$updated_xray" == "true" ]]; then
-        _info "已自动从上游更新 Xray 核心到 v${new_ver#v}，正在重启服务..."
+        _info "已自动从上游更新 Xray 核心到 v${new_xray_ver#v}，正在重启服务..."
         svc restart vless-reality 2>/dev/null
+        svc restart vless-ss2022-shadowtls-backend 2>/dev/null
     fi
     if [[ "$updated_singbox" == "true" ]]; then
-        _info "已自动从上游更新 Sing-box 核心到 v${new_ver#v}，正在重启服务..."
+        _info "已自动从上游更新 Sing-box 核心到 v${new_singbox_ver#v}，正在重启服务..."
         svc restart vless-singbox 2>/dev/null
     fi
 }
@@ -12780,6 +12806,59 @@ install_nginx() {
     fi
 }
 
+# 安全升级 Nginx 软件包：只升级包版本，不改写现有 nginx/订阅配置
+upgrade_nginx_security() {
+    if ! check_cmd nginx; then
+        _warn "Nginx 未安装，跳过安全升级"
+        return 0
+    fi
+
+    local was_running=false
+    svc status nginx >/dev/null 2>&1 && was_running=true
+
+    local before after
+    before=$(nginx -v 2>&1 | awk -F/ '{print $2}')
+    _info "升级 Nginx 软件包到发行版仓库可用的安全版本 (保留现有配置)..."
+
+    case "$DISTRO" in
+        alpine)
+            apk update >/dev/null 2>&1
+            apk upgrade --available nginx
+            ;;
+        centos)
+            if command -v dnf >/dev/null 2>&1; then
+                dnf upgrade -y nginx
+            else
+                yum update -y nginx
+            fi
+            ;;
+        debian|ubuntu)
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --only-upgrade \
+                -o Dpkg::Options::="--force-confold" nginx
+            ;;
+        *)
+            _err "暂不支持当前系统的 Nginx 自动安全升级"
+            return 1
+            ;;
+    esac
+
+    after=$(nginx -v 2>&1 | awk -F/ '{print $2}')
+
+    if nginx -t >/dev/null 2>&1; then
+        if [[ "$was_running" == "true" ]]; then
+            svc reload nginx 2>/dev/null || svc restart nginx 2>/dev/null || true
+        else
+            svc stop nginx 2>/dev/null || true
+        fi
+    else
+        _warn "Nginx 配置检测未通过，已跳过 reload，请手动执行 nginx -t 检查"
+    fi
+
+    _ok "Nginx 安全升级完成 (${before:-unknown} -> ${after:-unknown})"
+    return 0
+}
+
 EXTERNAL_LINKS_FILE="$CFG/external_links.txt"
 EXTERNAL_SUBS_FILE="$CFG/external_subs.txt"
 EXTERNAL_CACHE_DIR="$CFG/external_nodes_cache"
@@ -16441,33 +16520,115 @@ do_update() {
 
 _force_update_cores() {
     _header
-    echo -e "  ${W}强制核心组件更新${NC}"
+    echo -e "  ${W}强制协议组件更新${NC}"
     _line
-    _info "尝试强制从上游获取最新 Xray / Sing-box 核心..."
+    _info "按已安装协议从上游获取最新运行时组件..."
     
     local updated=false
-    if check_cmd xray && [[ -n $(db_list_protocols "xray") ]]; then
-        install_xray "true"
-        svc restart vless-reality 2>/dev/null
-        updated=true
+    local failed=()
+
+    _uses_proto() {
+        local proto
+        for proto in "$@"; do
+            is_protocol_installed "$proto" && return 0
+        done
+        return 1
+    }
+
+    _restart_if_present() {
+        local name="$1"
+        local exists=false
+        svc status "$name" >/dev/null 2>&1 && exists=true
+        [[ -f "/etc/systemd/system/${name}.service" || -f "/etc/init.d/${name}" ]] && exists=true
+        [[ "$exists" == "true" ]] && svc restart "$name" 2>/dev/null || true
+    }
+
+    _update_runtime() {
+        local label="$1" installer="$2"
+        _info "更新 $label..."
+        if "$installer" "true"; then
+            updated=true
+            return 0
+        fi
+        failed+=("$label")
+        return 1
+    }
+
+    local need_xray=false
+    [[ -n $(db_list_protocols "xray") ]] && need_xray=true
+    _uses_proto ss2022-shadowtls && need_xray=true
+    if [[ "$need_xray" == "true" ]]; then
+        if _update_runtime "Xray" install_xray; then
+            _restart_if_present vless-reality
+            _restart_if_present vless-ss2022-shadowtls-backend
+        fi
     fi
-    if check_cmd sing-box && [[ -n $(db_list_protocols "singbox") ]]; then
-        install_singbox "true"
-        svc restart vless-singbox 2>/dev/null
-        updated=true
+
+    if _uses_proto hy2 tuic; then
+        if _update_runtime "Sing-box" install_singbox; then
+            _restart_if_present vless-singbox
+        fi
+    fi
+
+    if _uses_proto snell snell-shadowtls; then
+        if _update_runtime "Snell v4" install_snell; then
+            _restart_if_present vless-snell
+            _restart_if_present vless-snell-shadowtls-backend
+        fi
+    fi
+
+    if _uses_proto snell-v5 snell-v5-shadowtls; then
+        if _update_runtime "Snell v5" install_snell_v5; then
+            _restart_if_present vless-snell-v5
+            _restart_if_present vless-snell-v5-shadowtls-backend
+        fi
+    fi
+
+    if _uses_proto snell-shadowtls snell-v5-shadowtls ss2022-shadowtls; then
+        if _update_runtime "ShadowTLS" install_shadowtls; then
+            _restart_if_present vless-snell-shadowtls
+            _restart_if_present vless-snell-v5-shadowtls
+            _restart_if_present vless-ss2022-shadowtls
+        fi
+    fi
+
+    if _uses_proto anytls; then
+        if _update_runtime "AnyTLS" install_anytls; then
+            _restart_if_present vless-anytls
+        fi
+    fi
+
+    if _uses_proto naive; then
+        if _update_runtime "NaïveProxy" install_naive; then
+            _restart_if_present vless-naive
+        fi
     fi
     
-    if [[ "$updated" == "true" ]]; then
-        _ok "核心组件升级完成并已重启"
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        _warn "以下组件更新失败: ${failed[*]}"
+    elif [[ "$updated" == "true" ]]; then
+        _ok "协议运行时组件检查/更新完成，相关服务已重启"
     else
-        _warn "未发现已安装并且在使用中的核心"
+        _warn "未发现已安装并且在使用中的协议组件"
     fi
+    _pause
+}
+
+_upgrade_nginx_security_menu() {
+    _header
+    echo -e "  ${W}Nginx 安全升级${NC}"
+    _line
+    echo -e "  ${D}仅升级 nginx 软件包，保留现有 nginx 配置与订阅设置。${NC}"
+    _line
+    read -rp "  确认执行? [y/N]: " confirm
+    [[ "$confirm" =~ ^[yY]$ ]] || return 0
+    upgrade_nginx_security
     _pause
 }
 
 _toggle_auto_update_core() {
     _header
-    echo -e "  ${W}自动更新核心配置${NC}"
+    echo -e "  ${W}自动更新 Xray/Sing-box 核心配置${NC}"
     _line
     
     if [[ ! -f "$CFG/db.json" ]]; then
@@ -16483,7 +16644,7 @@ _toggle_auto_update_core() {
     local tmp_db=$(mktemp)
     if jq --arg val "$new_val" '.auto_update_core = ($val == "true")' "$CFG/db.json" > "$tmp_db" 2>/dev/null; then
         mv "$tmp_db" "$CFG/db.json"
-        _ok "开机/启动自动更新核心已 $([[ "$new_val" == "true" ]] && echo -e "${G}开启${NC}" || echo -e "${R}关闭${NC}")"
+        _ok "开机/启动自动更新 Xray/Sing-box 核心已 $([[ "$new_val" == "true" ]] && echo -e "${G}开启${NC}" || echo -e "${R}关闭${NC}")"
     else
         rm -f "$tmp_db"
         _err "修改配置失败"
@@ -16534,10 +16695,11 @@ update_manage_menu() {
             fi
         fi
         
-        _item "1" "检查并更新脚本 (现有的 do_update)"
-        _item "2" "核心组件立即更新 (强制重拉 Xray/Sing-box 新版)"
-        _item "3" "配置启动自动更新核心 $current_auto"
+        _item "1" "检查并更新脚本"
+        _item "2" "协议组件立即更新 (Xray/Sing-box/Snell/AnyTLS/ShadowTLS/NaïveProxy)"
+        _item "3" "配置启动自动更新 Xray/Sing-box $current_auto"
         _item "4" "强制续期 ACME 证书"
+        _item "5" "Nginx 安全升级 (不改配置/订阅)"
         _item "0" "返回上级菜单"
         _line
         
@@ -16547,6 +16709,7 @@ update_manage_menu() {
             2) _force_update_cores ;;
             3) _toggle_auto_update_core ;;
             4) _force_renew_cert ;;
+            5) _upgrade_nginx_security_menu ;;
             0) return ;;
             *) _err "无效选择" ;;
         esac

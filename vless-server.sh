@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.6.0[服务端]
+#  多协议代理一键部署脚本 v3.6.1[服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -20,7 +20,7 @@
 
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.6.0"
+readonly VERSION="3.6.1"
 readonly AUTHOR="Skillet5091"
 readonly REPO_URL="https://github.com/Skillet5091/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -50,10 +50,138 @@ _pgrep() {
 #═══════════════════════════════════════════════════════════════════════════════
 readonly DB_FILE="$CFG/db.json"
 
+secure_cfg_dir() {
+    mkdir -p "$CFG" || return 1
+    local nginx_group
+    nginx_group=$(detect_nginx_group)
+    if [[ -n "$nginx_group" ]]; then
+        chgrp "$nginx_group" "$CFG" 2>/dev/null || true
+        chmod 750 "$CFG" 2>/dev/null || true
+    else
+        chmod 700 "$CFG" 2>/dev/null || true
+    fi
+}
+
+secure_file_600() {
+    local file="$1"
+    [[ -f "$file" ]] && chmod 600 "$file" 2>/dev/null || true
+}
+
+detect_nginx_user() {
+    local user=""
+    if [[ -f /etc/nginx/nginx.conf ]]; then
+        user=$(awk '/^[[:space:]]*user[[:space:]]+/ {gsub(";", "", $2); print $2; exit}' /etc/nginx/nginx.conf 2>/dev/null)
+    fi
+    if [[ -n "$user" ]] && id "$user" >/dev/null 2>&1; then
+        printf '%s\n' "$user"
+        return 0
+    fi
+    for user in www-data nginx http; do
+        if id "$user" >/dev/null 2>&1; then
+            printf '%s\n' "$user"
+            return 0
+        fi
+    done
+    return 1
+}
+
+detect_nginx_group() {
+    local user group
+    user=$(detect_nginx_user) || return 1
+    group=$(id -gn "$user" 2>/dev/null) || return 1
+    [[ -n "$group" ]] && printf '%s\n' "$group"
+}
+
+secure_subscription_permissions() {
+    local sub_dir="$1"
+    local nginx_group
+    nginx_group=$(detect_nginx_group)
+
+    mkdir -p "$CFG/subscription" "$sub_dir" || return 1
+    if [[ -n "$nginx_group" ]]; then
+        chgrp "$nginx_group" "$CFG" "$CFG/subscription" "$sub_dir" 2>/dev/null || true
+        chmod 750 "$CFG" "$CFG/subscription" "$sub_dir" 2>/dev/null || true
+        find "$sub_dir" -type f -exec chgrp "$nginx_group" {} + 2>/dev/null || true
+        find "$sub_dir" -type f -exec chmod 640 {} + 2>/dev/null || true
+    else
+        chmod 700 "$CFG" "$CFG/subscription" "$sub_dir" 2>/dev/null || true
+        find "$sub_dir" -type f -exec chmod 600 {} + 2>/dev/null || true
+        _warn "未检测到 Nginx 用户，订阅文件已设为仅 root 可读；安装/配置 Nginx 后请重新生成订阅"
+    fi
+}
+
+_is_kv_key_allowed() {
+    case "$1" in
+        sub_uuid|sub_port|sub_domain|sub_https|template_id|template_url|installed_at)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+write_kv_file() {
+    local file="$1"; shift
+    local tmp; tmp=$(mktemp) || return 1
+    local key val
+    while [[ $# -ge 2 ]]; do
+        key="$1"
+        val="$2"
+        shift 2
+        _is_kv_key_allowed "$key" || continue
+        val="${val//$'\r'/}"
+        val="${val//$'\n'/}"
+        printf '%s=%s\n' "$key" "$val" >> "$tmp"
+    done
+    mkdir -p "$(dirname "$file")"
+    [[ "$(dirname "$file")" == "$CFG" ]] && secure_cfg_dir
+    mv "$tmp" "$file"
+    chmod 600 "$file" 2>/dev/null || true
+}
+
+load_kv_file() {
+    local file="$1"; shift
+    [[ -f "$file" ]] || return 1
+    local allowed=" $* "
+    local key
+    for key in "$@"; do
+        printf -v "$key" '%s' ""
+    done
+    local line val
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line//$'\r'/}"
+        [[ "$line" != *=* ]] && continue
+        key="${line%%=*}"
+        val="${line#*=}"
+        [[ "$allowed" == *" $key "* ]] || continue
+        _is_kv_key_allowed "$key" || continue
+        printf -v "$key" '%s' "$val"
+    done < "$file"
+}
+
+load_sub_info() {
+    load_kv_file "$CFG/sub.info" sub_uuid sub_port sub_domain sub_https
+}
+
+write_sub_info() {
+    write_kv_file "$CFG/sub.info" \
+        sub_uuid "$1" sub_port "$2" sub_domain "$3" sub_https "$4"
+}
+
+write_mask_info() {
+    write_kv_file "$CFG/mask.info" \
+        template_id "$1" template_url "$2" installed_at "$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
+}
+
+load_mask_info() {
+    load_kv_file "$CFG/mask.info" template_id template_url installed_at
+}
+
 # 初始化数据库
 init_db() {
-    mkdir -p "$CFG" || return 1
-    [[ -f "$DB_FILE" ]] && return 0
+    secure_cfg_dir || return 1
+    if [[ -f "$DB_FILE" ]]; then
+        secure_file_600 "$DB_FILE"
+        return 0
+    fi
     local now tmp
     # Alpine busybox date 不支持 -Iseconds，使用兼容格式
     now=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')
@@ -61,10 +189,12 @@ init_db() {
     if jq -n --arg v "4.0.0" --arg t "$now" \
       '{version:$v,xray:{},singbox:{},meta:{created:$t,updated:$t}}' >"$tmp" 2>/dev/null; then
         mv "$tmp" "$DB_FILE"
+        secure_file_600 "$DB_FILE"
         return 0
     fi
     # jq 失败时使用简单方式创建
     echo '{"version":"4.0.0","xray":{},"singbox":{},"meta":{}}' > "$DB_FILE"
+    secure_file_600 "$DB_FILE"
     rm -f "$tmp"
     return 0
 }
@@ -77,6 +207,7 @@ _db_touch() {
     tmp=$(mktemp) || return 1
     if jq --arg t "$now" '.meta.updated=$t' "$DB_FILE" >"$tmp"; then
         mv "$tmp" "$DB_FILE"
+        secure_file_600 "$DB_FILE"
     else
         rm -f "$tmp"
         return 1
@@ -88,6 +219,7 @@ _db_apply() { # _db_apply [jq args...] 'filter'
     local tmp; tmp=$(mktemp) || return 1
     if jq "$@" "$DB_FILE" >"$tmp" 2>/dev/null; then
         mv "$tmp" "$DB_FILE"
+        secure_file_600 "$DB_FILE"
         _db_touch
         return 0
     fi
@@ -1073,11 +1205,11 @@ xray_api_query() {
         return 1
     fi
     
-    local cmd="xray api statsquery --server=127.0.0.1:${XRAY_API_PORT}"
-    [[ "$reset" == "true" ]] && cmd+=" -reset"
-    [[ -n "$pattern" ]] && cmd+=" -pattern \"$pattern\""
+    local -a args=(api statsquery --server=127.0.0.1:${XRAY_API_PORT})
+    [[ "$reset" == "true" ]] && args+=(-reset)
+    [[ -n "$pattern" ]] && args+=(-pattern "$pattern")
     
-    eval "$cmd" 2>/dev/null
+    xray "${args[@]}" 2>/dev/null
 }
 
 # 获取用户流量 (上行+下行)
@@ -1317,16 +1449,26 @@ build_config() {
 }
 
 # 保存 JOIN 信息到文件
-# 用法: _save_join_info "协议名" "数据格式" "链接生成命令" [额外行...]
+# 用法: _save_join_info "协议名" "数据格式" 链接生成函数 [链接函数参数...]
 # 数据格式中 %s 会被替换为 IP，%b 会被替换为 [IP] (IPv6 带括号)
-# 示例: _save_join_info "vless" "REALITY|%s|$port|$uuid" "gen_vless_link %s $port $uuid"
+# 示例: _save_join_info "vless" "REALITY|%s|$port|$uuid" gen_vless_link "$port" "$uuid"
 _save_join_info() {
-    local protocol="$1" data_fmt="$2" link_cmd="$3"; shift 3
+    local protocol="$1" data_fmt="$2" link_func="$3"; shift 3
     local join_file="$CFG/${protocol}.join"
     local link_prefix; link_prefix=$(tr '[:lower:]-' '[:upper:]_' <<<"$protocol")
+    secure_cfg_dir
     : >"$join_file"
+    chmod 600 "$join_file" 2>/dev/null || true
 
-    local label ip ipfmt data code cmd link
+    if ! declare -F "$link_func" >/dev/null 2>&1; then
+        _err "链接生成函数不存在: $link_func"
+        return 1
+    fi
+
+    local uses_ip=false
+    [[ "$data_fmt" == *"%s"* || "$data_fmt" == *"%b"* ]] && uses_ip=true
+
+    local label ip ipfmt data code link
     for label in V4 V6; do
         ip=$([[ "$label" == V4 ]] && get_ipv4 || get_ipv6)
         [[ -z "$ip" ]] && continue
@@ -1334,16 +1476,22 @@ _save_join_info() {
 
         data=${data_fmt//%s/$ipfmt}; data=${data//%b/$ipfmt}
         code=$(printf '%s' "$data" | base64 -w 0 2>/dev/null || printf '%s' "$data" | base64)
-        cmd=${link_cmd//%s/$ipfmt}; cmd=${cmd//%b/$ipfmt}
-        link=$(eval "$cmd")
+        if [[ "$uses_ip" == "true" ]]; then
+            link=$("$link_func" "$ipfmt" "$@")
+        else
+            link=$("$link_func" "$@")
+        fi
 
         printf '# IPv%s\nJOIN_%s=%s\n%s_%s=%s\n' "${label#V}" "$label" "$code" "$link_prefix" "$label" "$link" >>"$join_file"
     done
+    chmod 600 "$join_file" 2>/dev/null || true
+}
 
-    local line
-    for line in "$@"; do
-        printf '%s\n' "$line" >>"$join_file"
-    done
+copy_join_txt() {
+    local join_file="$1"
+    [[ -f "$join_file" ]] || return 1
+    cp "$join_file" "$CFG/join.txt" 2>/dev/null || return 1
+    chmod 600 "$CFG/join.txt" 2>/dev/null || true
 }
 
 
@@ -2255,8 +2403,10 @@ cleanup_hy2_nat_rules() {
     fi
     # 兜底清理
     for chain in PREROUTING OUTPUT; do
-        iptables -t nat -S $chain 2>/dev/null | grep -E "REDIRECT.*--to-ports" | while read -r rule; do
-            eval "iptables -t nat $(echo "$rule" | sed 's/^-A/-D/')" 2>/dev/null
+        iptables -t nat -S "$chain" 2>/dev/null | grep -E "REDIRECT.*--to-ports" | while read -r rule; do
+            local -a delete_rule=()
+            read -r -a delete_rule <<< "${rule/-A /-D }"
+            [[ ${#delete_rule[@]} -gt 0 ]] && iptables -t nat "${delete_rule[@]}" 2>/dev/null
         done
     done
 }
@@ -3000,9 +3150,7 @@ create_fake_website() {
             _ok "高级模板下载并应用成功 (Template #$random_num)"
             
             # 保存模板信息
-            echo "template_id=$random_num" > "$CFG/mask.info"
-            echo "template_url=$template_url" >> "$CFG/mask.info"
-            echo "installed_at=$(date -Iseconds)" >> "$CFG/mask.info"
+            write_mask_info "$random_num" "$template_url"
         fi
     else
         _warn "未安装 unzip，无法解压模板"
@@ -3175,12 +3323,7 @@ EOF
             use_https="true"
         fi
         
-        cat > "$CFG/sub.info" << EOF
-sub_uuid=$sub_uuid
-sub_port=$sub_port_to_save
-sub_domain=$domain
-sub_https=$use_https
-EOF
+        write_sub_info "$sub_uuid" "$sub_port_to_save" "$domain" "$use_https"
         _log "INFO" "订阅配置已保存: UUID=${sub_uuid:0:8}..., 端口=$sub_port_to_save, 域名=$domain"
     fi
 }
@@ -3196,7 +3339,8 @@ manage_masquerade() {
         
         # 显示当前状态
         if [[ -f "$CFG/mask.info" ]]; then
-            source "$CFG/mask.info"
+            local template_id="" template_url="" installed_at=""
+            load_mask_info
             echo -e "  状态: ${G}已配置${NC}"
             echo -e "  模板: ${G}#${template_id:-未知}${NC}"
             [[ -n "$installed_at" ]] && echo -e "  安装时间: ${D}$installed_at${NC}"
@@ -3236,9 +3380,7 @@ manage_masquerade() {
                         rmdir "$subdir" 2>/dev/null
                     fi
                     
-                    echo "template_id=$random_num" > "$CFG/mask.info"
-                    echo "template_url=$template_url" >> "$CFG/mask.info"
-                    echo "installed_at=$(date -Iseconds)" >> "$CFG/mask.info"
+                    write_mask_info "$random_num" "$template_url"
                     _ok "模板 #$random_num 已应用"
                     systemctl reload nginx 2>/dev/null || rc-service nginx reload 2>/dev/null
                 else
@@ -3260,9 +3402,7 @@ manage_masquerade() {
                             rmdir "$subdir" 2>/dev/null
                         fi
                         
-                        echo "template_id=$num" > "$CFG/mask.info"
-                        echo "template_url=$template_url" >> "$CFG/mask.info"
-                        echo "installed_at=$(date -Iseconds)" >> "$CFG/mask.info"
+                        write_mask_info "$num" "$template_url"
                         _ok "模板 #$num 已应用"
                         systemctl reload nginx 2>/dev/null || rc-service nginx reload 2>/dev/null
                     else
@@ -3287,9 +3427,7 @@ manage_masquerade() {
                             rmdir "$subdir" 2>/dev/null
                         fi
                         
-                        echo "template_id=custom" > "$CFG/mask.info"
-                        echo "template_url=$custom_url" >> "$CFG/mask.info"
-                        echo "installed_at=$(date -Iseconds)" >> "$CFG/mask.info"
+                        write_mask_info "custom" "$custom_url"
                         _ok "自定义模板已应用"
                         systemctl reload nginx 2>/dev/null || rc-service nginx reload 2>/dev/null
                     else
@@ -3331,7 +3469,8 @@ BASIC_HTML
                 ;;
             5)
                 if [[ -f "$CFG/sub.info" ]]; then
-                    source "$CFG/sub.info"
+                    local sub_uuid="" sub_port="" sub_domain="" sub_https=""
+                    load_sub_info
                     local protocol="https"
                     [[ "$sub_https" == "false" ]] && protocol="http"
                     local url="${protocol}://${sub_domain}:${sub_port}/"
@@ -3718,14 +3857,20 @@ install_acme_tool() {
     
     _info "安装 acme.sh 证书申请工具..."
     
-    # 方法1: 官方安装脚本
-    if curl -sL https://get.acme.sh | sh -s email=admin@example.com 2>&1 | grep -qE "Install success|already installed"; then
-        source "$HOME/.acme.sh/acme.sh.env" 2>/dev/null || true
-        if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
-            _ok "acme.sh 安装成功"
-            return 0
+    # 方法1: 官方安装脚本（先落盘再执行，避免网络内容直接管道进 shell）
+    local tmp_acme_dir tmp_acme_installer
+    tmp_acme_dir=$(mktemp -d)
+    tmp_acme_installer="$tmp_acme_dir/acme-install.sh"
+    if curl -fsSLo "$tmp_acme_installer" https://get.acme.sh 2>/dev/null; then
+        if sh "$tmp_acme_installer" email=admin@example.com 2>&1 | grep -qE "Install success|already installed"; then
+            rm -rf "$tmp_acme_dir"
+            if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
+                _ok "acme.sh 安装成功"
+                return 0
+            fi
         fi
     fi
+    rm -rf "$tmp_acme_dir"
     
     # 方法2: 使用 git clone
     if command -v git &>/dev/null; then
@@ -3868,7 +4013,7 @@ _issue_cert_dns() {
     read -rp "  请选择 DNS 服务商 [1-4]: " dns_choice
     
     local dns_api=""
-    local dns_env=""
+    local cf_token="" ali_key="" ali_secret="" dp_id="" dp_key=""
     
     case "$dns_choice" in
         1)
@@ -3880,7 +4025,6 @@ _issue_cert_dns() {
             read -rp "  请输入 CF_Token: " cf_token
             [[ -z "$cf_token" ]] && { _err "Token 不能为空"; return 1; }
             dns_api="dns_cf"
-            dns_env="CF_Token=$cf_token"
             ;;
         2)
             echo ""
@@ -3891,7 +4035,6 @@ _issue_cert_dns() {
             read -rp "  请输入 Ali_Secret: " ali_secret
             [[ -z "$ali_key" || -z "$ali_secret" ]] && { _err "Key/Secret 不能为空"; return 1; }
             dns_api="dns_ali"
-            dns_env="Ali_Key=$ali_key Ali_Secret=$ali_secret"
             ;;
         3)
             echo ""
@@ -3902,7 +4045,6 @@ _issue_cert_dns() {
             read -rp "  请输入 DP_Key: " dp_key
             [[ -z "$dp_id" || -z "$dp_key" ]] && { _err "ID/Key 不能为空"; return 1; }
             dns_api="dns_dp"
-            dns_env="DP_Id=$dp_id DP_Key=$dp_key"
             ;;
         4)
             # 手动 DNS 验证
@@ -3936,7 +4078,11 @@ _issue_cert_dns() {
     echo ""
     
     # 设置环境变量并申请证书
-    eval "export $dns_env"
+    case "$dns_api" in
+        dns_cf)  export CF_Token="$cf_token" ;;
+        dns_ali) export Ali_Key="$ali_key" Ali_Secret="$ali_secret" ;;
+        dns_dp)  export DP_Id="$dp_id" DP_Key="$dp_key" ;;
+    esac
     
     local reload_cmd="chmod 600 $cert_dir/${domain}.key; chmod 644 $cert_dir/${domain}.crt"
     
@@ -4269,7 +4415,8 @@ setup_cert_and_nginx() {
     
     # 读取已有的订阅配置（优先使用实际配置的端口）
     if [[ -f "$CFG/sub.info" ]]; then
-        source "$CFG/sub.info" 2>/dev/null
+        local sub_uuid="" sub_port="" sub_domain="" sub_https=""
+        load_sub_info || true
         NGINX_PORT="${sub_port:-$default_nginx_port}"
     else
         NGINX_PORT="$default_nginx_port"
@@ -4726,7 +4873,7 @@ _map_arch() {
 
 # 通用二进制下载安装函数
 _install_binary() {
-    local name="$1" repo="$2" url_pattern="$3" extract_cmd="$4" force_update="$5"
+    local name="$1" repo="$2" url_pattern="$3" install_kind="$4" force_update="$5"
     
     local current_version=""
     if check_cmd "$name"; then
@@ -4753,13 +4900,41 @@ _install_binary() {
     
     local arch=$(uname -m)
     local tmp=$(mktemp -d)
-    local url=$(eval echo "$url_pattern")
+    local url="$url_pattern"
+    url="${url//\$\{version\}/$version}"
+    url="${url//\$version/$version}"
+    url="${url//\$\{xarch\}/${xarch:-}}"
+    url="${url//\$\{sarch\}/${sarch:-}}"
     
     if curl -fsSLo "$tmp/pkg" --connect-timeout "$CURL_TIMEOUT_DOWNLOAD" --retry 3 "$url"; then
-        eval "$extract_cmd"
-        rm -rf "$tmp"
-        _ok "$name v$version 已安装"
-        return 0
+        local install_ok=false
+        case "$install_kind" in
+            xray)
+                if unzip -oq "$tmp/pkg" -d "$tmp/" && install -m 755 "$tmp/xray" /usr/local/bin/xray; then
+                    mkdir -p /usr/local/share/xray
+                    cp "$tmp"/*.dat /usr/local/share/xray/ 2>/dev/null || true
+                    fix_selinux_context
+                    install_ok=true
+                fi
+                ;;
+            sing-box)
+                local singbox_bin=""
+                if tar -xzf "$tmp/pkg" -C "$tmp/"; then
+                    singbox_bin=$(find "$tmp" -name sing-box -type f | head -1)
+                    if [[ -n "$singbox_bin" ]]; then
+                        install -m 755 "$singbox_bin" /usr/local/bin/sing-box && install_ok=true
+                    fi
+                fi
+                ;;
+            *)
+                _err "未知安装类型: $install_kind"
+                ;;
+        esac
+        if [[ "$install_ok" == "true" ]]; then
+            rm -rf "$tmp"
+            _ok "$name v$version 已安装"
+            return 0
+        fi
     fi
     rm -rf "$tmp"
     _err "下载 $name 失败"
@@ -4775,7 +4950,7 @@ install_xray() {
     fi
     _install_binary "xray" "XTLS/Xray-core" \
         'https://github.com/XTLS/Xray-core/releases/download/v$version/Xray-linux-${xarch}.zip' \
-        'unzip -oq "$tmp/pkg" -d "$tmp/" && install -m 755 "$tmp/xray" /usr/local/bin/xray && mkdir -p /usr/local/share/xray && cp "$tmp"/*.dat /usr/local/share/xray/ 2>/dev/null; fix_selinux_context' \
+        "xray" \
         "$force_update"
 }
 
@@ -4792,7 +4967,7 @@ install_singbox() {
     fi
     _install_binary "sing-box" "SagerNet/sing-box" \
         'https://github.com/SagerNet/sing-box/releases/download/v$version/sing-box-$version-linux-${sarch}.tar.gz' \
-        'tar -xzf "$tmp/pkg" -C "$tmp/" && install -m 755 "$(find "$tmp" -name sing-box -type f | head -1)" /usr/local/bin/sing-box' \
+        "sing-box" \
         "$force_update"
 }
 
@@ -5276,7 +5451,7 @@ gen_server_config() {
         public_key "$pubkey" short_id "$sid" sni "$sni")"
     
     _save_join_info "vless" "REALITY|%s|$port|$uuid|$pubkey|$sid|$sni" \
-        "gen_vless_link %s $port $uuid $pubkey $sid $sni"
+        gen_vless_link "$port" "$uuid" "$pubkey" "$sid" "$sni"
     echo "server" > "$CFG/role"
 }
 
@@ -5290,7 +5465,7 @@ gen_vless_xhttp_server_config() {
         public_key "$pubkey" short_id "$sid" sni "$sni" path "$path")"
     
     _save_join_info "vless-xhttp" "REALITY-XHTTP|%s|$port|$uuid|$pubkey|$sid|$sni|$path" \
-        "gen_vless_xhttp_link %s $port $uuid $pubkey $sid $sni $path"
+        gen_vless_xhttp_link "$port" "$uuid" "$pubkey" "$sid" "$sni" "$path"
     echo "server" > "$CFG/role"
 }
 
@@ -5344,8 +5519,9 @@ gen_hy2_server_config() {
     [[ "$hop_enable" == "1" ]] && extra_lines=("" "# 端口跳跃已启用" "# 客户端请手动将端口改为: ${hop_start}-${hop_end}")
     
     _save_join_info "hy2" "HY2|%s|$port|$password|$sni" \
-        "gen_hy2_link %s $port $password $sni" "${extra_lines[@]}"
-    cp "$CFG/hy2.join" "$CFG/join.txt" 2>/dev/null
+        gen_hy2_link "$port" "$password" "$sni"
+    [[ ${#extra_lines[@]} -gt 0 ]] && printf '%s\n' "${extra_lines[@]}" >> "$CFG/hy2.join"
+    copy_join_txt "$CFG/hy2.join"
     echo "server" > "$CFG/role"
 }
 
@@ -5358,7 +5534,7 @@ gen_trojan_server_config() {
 
     register_protocol "trojan" "$(build_config password "$password" port "$port" sni "$sni")"
     _save_join_info "trojan" "TROJAN|%s|$port|$password|$sni" \
-        "gen_trojan_link %s $port $password $sni"
+        gen_trojan_link "$port" "$password" "$sni"
     echo "server" > "$CFG/role"
 }
 
@@ -5373,7 +5549,7 @@ gen_vless_ws_server_config() {
     register_protocol "vless-ws" "$(build_config \
         uuid "$uuid" port "$port" outer_port "$outer_port" sni "$sni" path "$path")"
     _save_join_info "vless-ws" "VLESS-WS|%s|$outer_port|$uuid|$sni|$path" \
-        "gen_vless_ws_link %s $outer_port $uuid $sni $path"
+        gen_vless_ws_link "$outer_port" "$uuid" "$sni" "$path"
     echo "server" > "$CFG/role"
 }
 
@@ -5388,7 +5564,7 @@ gen_vmess_ws_server_config() {
     register_protocol "vmess-ws" "$(build_config \
         uuid "$uuid" port "$port" outer_port "$outer_port" sni "$sni" path "$path")"
     _save_join_info "vmess-ws" "VMESSWS|%s|$outer_port|$uuid|$sni|$path" \
-        "gen_vmess_ws_link %s $outer_port $uuid $sni $path"
+        gen_vmess_ws_link "$outer_port" "$uuid" "$sni" "$path"
     echo "server" > "$CFG/role"
 }
 
@@ -5401,7 +5577,7 @@ gen_vless_vision_server_config() {
 
     register_protocol "vless-vision" "$(build_config uuid "$uuid" port "$port" sni "$sni")"
     _save_join_info "vless-vision" "VLESS-VISION|%s|$port|$uuid|$sni" \
-        "gen_vless_vision_link %s $port $uuid $sni"
+        gen_vless_vision_link "$port" "$uuid" "$sni"
     echo "server" > "$CFG/role"
 }
 
@@ -5412,7 +5588,7 @@ gen_ss2022_server_config() {
 
     register_protocol "ss2022" "$(build_config password "$password" port "$port" method "$method")"
     _save_join_info "ss2022" "SS2022|%s|$port|$method|$password" \
-        "gen_ss2022_link %s $port $method $password"
+        gen_ss2022_link "$port" "$method" "$password"
     echo "server" > "$CFG/role"
 }
 
@@ -5423,7 +5599,7 @@ gen_ss_legacy_server_config() {
 
     register_protocol "ss-legacy" "$(build_config password "$password" port "$port" method "$method")"
     _save_join_info "ss-legacy" "SS|%s|$port|$method|$password" \
-        "gen_ss_legacy_link %s $port $method $password"
+        gen_ss_legacy_link "$port" "$method" "$password"
     echo "server" > "$CFG/role"
 }
 
@@ -5443,8 +5619,8 @@ EOF
     register_protocol "snell" "$(build_config psk "$psk" port "$port" version "$version")"
 
     _save_join_info "snell" "SNELL|%s|$port|$psk|$version" \
-        "gen_snell_link %s $port $psk $version"
-    cp "$CFG/snell.join" "$CFG/join.txt" 2>/dev/null
+        gen_snell_link "$port" "$psk" "$version"
+    copy_join_txt "$CFG/snell.join"
     echo "server" > "$CFG/role"
 }
 
@@ -5500,8 +5676,9 @@ gen_tuic_server_config() {
     [[ "$hop_enable" == "1" ]] && extra_lines=("" "# 端口跳跃已启用" "# 客户端请手动将端口改为: ${hop_start}-${hop_end}")
     
     _save_join_info "tuic" "TUIC|%s|$port|$uuid|$password|$sni" \
-        "gen_tuic_link %s $port $uuid $password $sni" "${extra_lines[@]}"
-    cp "$CFG/tuic.join" "$CFG/join.txt" 2>/dev/null
+        gen_tuic_link "$port" "$uuid" "$password" "$sni"
+    [[ ${#extra_lines[@]} -gt 0 ]] && printf '%s\n' "${extra_lines[@]}" >> "$CFG/tuic.join"
+    copy_join_txt "$CFG/tuic.join"
     echo "server" > "$CFG/role"
 }
 
@@ -5512,8 +5689,8 @@ gen_anytls_server_config() {
 
     register_protocol "anytls" "$(build_config password "$password" port "$port" sni "$sni")"
     _save_join_info "anytls" "ANYTLS|%s|$port|$password|$sni" \
-        "gen_anytls_link %s $port $password $sni"
-    cp "$CFG/anytls.join" "$CFG/join.txt" 2>/dev/null
+        gen_anytls_link "$port" "$password" "$sni"
+    copy_join_txt "$CFG/anytls.join"
     echo "server" > "$CFG/role"
 }
 
@@ -5556,8 +5733,8 @@ EOF
     register_protocol "naive" "$(build_config username "$username" password "$password" port "$port" domain "$domain")"
     # 链接使用域名而不是 IP
     _save_join_info "naive" "NAIVE|$domain|$port|$username|$password" \
-        "gen_naive_link $domain $port $username $password"
-    cp "$CFG/naive.join" "$CFG/join.txt" 2>/dev/null
+        gen_naive_link "$domain" "$port" "$username" "$password"
+    copy_join_txt "$CFG/naive.join"
     echo "server" > "$CFG/role"
 }
 
@@ -5643,6 +5820,7 @@ gen_socks_server_config() {
     # SOCKS5 的 join 信息比较特殊，需要两种链接格式
     local ipv4=$(get_ipv4) ipv6=$(get_ipv6)
     > "$CFG/socks.join"
+    chmod 600 "$CFG/socks.join" 2>/dev/null || true
     if [[ -n "$ipv4" ]]; then
         local data="SOCKS|$ipv4|$port|$username|$password"
         local code=$(printf '%s' "$data" | base64 -w 0 2>/dev/null || printf '%s' "$data" | base64)
@@ -5682,8 +5860,8 @@ EOF
 
     register_protocol "snell-v5" "$(build_config psk "$psk" port "$port" version "$version")"
     _save_join_info "snell-v5" "SNELL-V5|%s|$port|$psk|$version" \
-        "gen_snell_v5_link %s $port $psk $version"
-    cp "$CFG/snell-v5.join" "$CFG/join.txt" 2>/dev/null
+        gen_snell_v5_link "$port" "$psk" "$version"
+    copy_join_txt "$CFG/snell-v5.join"
     echo "server" > "$CFG/role"
 }
 
@@ -6370,6 +6548,15 @@ _auto_update_cores() {
     fi
 }
 
+validate_downloaded_script() {
+    local file="$1"
+    [[ -s "$file" ]] || return 1
+    head -n 1 "$file" | grep -qE '^#!/(usr/bin/env[[:space:]]+)?bash|^#!/bin/bash' || return 1
+    grep -q '^readonly VERSION="' "$file" || return 1
+    grep -q 'vless-all-in-one' "$file" || return 1
+    bash -n "$file" >/dev/null 2>&1
+}
+
 create_shortcut() {
     local system_script="/usr/local/bin/vless-server.sh"
     local current_script="$0"
@@ -6393,10 +6580,14 @@ create_shortcut() {
         else
             # 内存运行模式，从网络下载
             local raw_url="https://raw.githubusercontent.com/Skillet5091/vless-all-in-one/main/vless-server.sh"
-            if ! curl -sL --connect-timeout 10 -o "$system_script" "$raw_url"; then
+            local tmp_script
+            tmp_script=$(mktemp)
+            if ! curl -fsSL --connect-timeout 10 -o "$tmp_script" "$raw_url" || ! validate_downloaded_script "$tmp_script"; then
+                rm -f "$tmp_script"
                 _warn "无法下载脚本到系统目录"
                 return 1
             fi
+            mv "$tmp_script" "$system_script"
         fi
     elif [[ -n "$real_path" && -f "$real_path" && "$real_path" != "$system_script" ]]; then
         # 系统目录已有脚本，用当前脚本更新（不删除原文件）
@@ -8761,33 +8952,33 @@ _regenerate_all_join_files() {
         case "$proto" in
             vless)
                 _save_join_info "vless" "REALITY|%s|$port|$uuid|$public_key|$short_id|$sni" \
-                    "gen_vless_link %s $port $uuid $public_key $short_id $sni $country"
+                    gen_vless_link "$port" "$uuid" "$public_key" "$short_id" "$sni" "$country"
                 ;;
             vless-xhttp)
                 _save_join_info "vless-xhttp" "REALITY-XHTTP|%s|$port|$uuid|$public_key|$short_id|$sni|$path" \
-                    "gen_vless_xhttp_link %s $port $uuid $public_key $short_id $sni $path $country"
+                    gen_vless_xhttp_link "$port" "$uuid" "$public_key" "$short_id" "$sni" "$path" "$country"
                 ;;
             vless-ws)
                 local outer_port=$(_get_master_port "$port")
                 _save_join_info "vless-ws" "VLESS-WS|%s|$outer_port|$uuid|$sni|$path" \
-                    "gen_vless_ws_link %s $outer_port $uuid $sni $path $country"
+                    gen_vless_ws_link "$outer_port" "$uuid" "$sni" "$path" "$country"
                 ;;
             vmess-ws)
                 local outer_port=$(_get_master_port "$port")
                 _save_join_info "vmess-ws" "VMESSWS|%s|$outer_port|$uuid|$sni|$path" \
-                    "gen_vmess_ws_link %s $outer_port $uuid $sni $path $country"
+                    gen_vmess_ws_link "$outer_port" "$uuid" "$sni" "$path" "$country"
                 ;;
             vless-vision)
                 _save_join_info "vless-vision" "VLESS-VISION|%s|$port|$uuid|$sni" \
-                    "gen_vless_vision_link %s $port $uuid $sni $country"
+                    gen_vless_vision_link "$port" "$uuid" "$sni" "$country"
                 ;;
             trojan)
                 _save_join_info "trojan" "TROJAN|%s|$port|$password|$sni" \
-                    "gen_trojan_link %s $port $password $sni $country"
+                    gen_trojan_link "$port" "$password" "$sni" "$country"
                 ;;
             ss2022)
                 _save_join_info "ss2022" "SS2022|%s|$port|$method|$password" \
-                    "gen_ss2022_link %s $port $method $password $country"
+                    gen_ss2022_link "$port" "$method" "$password" "$country"
                 ;;
         esac
     done
@@ -8804,7 +8995,7 @@ _regenerate_all_join_files() {
         case "$proto" in
             hy2)
                 _save_join_info "hy2" "HY2|%s|$port|$password|$sni" \
-                    "gen_hy2_link %s $port $password $sni $country"
+                    gen_hy2_link "$port" "$password" "$sni" "$country"
                 ;;
         esac
     done
@@ -9053,12 +9244,14 @@ _update_join_files_country() {
         local tmp=$(mktemp)
         # 替换节点名称中的地区前缀 (如 HK-VLESS -> US-VLESS)
         sed -E "s/(#|%23)(${country_codes})-/\1${new_country}-/g" "$join_file" > "$tmp" && mv "$tmp" "$join_file"
+        chmod 600 "$join_file" 2>/dev/null || true
     done
     
     # 同时更新 join.txt
     if [[ -f "$CFG/join.txt" ]]; then
         local tmp=$(mktemp)
         sed -E "s/(#|%23)(${country_codes})-/\1${new_country}-/g" "$CFG/join.txt" > "$tmp" && mv "$tmp" "$CFG/join.txt"
+        chmod 600 "$CFG/join.txt" 2>/dev/null || true
     fi
     
     _ok "节点名称已更新为 ${new_country} 前缀"
@@ -11005,7 +11198,8 @@ show_single_protocol_info() {
         has_cert_protocol=true
         # 从 sub.info 读取实际配置的端口，否则使用默认 8443
         if [[ -f "$CFG/sub.info" ]]; then
-            source "$CFG/sub.info"
+            local sub_uuid="" sub_port="" sub_domain="" sub_https=""
+            load_sub_info || true
             nginx_port="${sub_port:-8443}"
         else
             nginx_port="8443"
@@ -11023,7 +11217,8 @@ show_single_protocol_info() {
     if [[ "$has_cert_protocol" == "true" ]]; then
         # 有证书协议，显示订阅状态
         if [[ "$web_service_running" == "true" && -f "$CFG/sub.info" ]]; then
-            source "$CFG/sub.info"
+            local sub_uuid="" sub_port="" sub_domain="" sub_https=""
+            load_sub_info || true
             local sub_protocol="http"
             [[ "$sub_https" == "true" ]] && sub_protocol="https"
             local display_host="${sub_domain:-$ipv4}"
@@ -12863,13 +13058,25 @@ EXTERNAL_LINKS_FILE="$CFG/external_links.txt"
 EXTERNAL_SUBS_FILE="$CFG/external_subs.txt"
 EXTERNAL_CACHE_DIR="$CFG/external_nodes_cache"
 
-# 订阅抓取：默认忽略 TLS 证书校验，兼容自签证书订阅源
-# 如需强制校验证书，可在执行前设置: VLESS_SUB_TLS_VERIFY=true
+secure_external_nodes_storage() {
+    secure_cfg_dir
+    [[ -f "$EXTERNAL_LINKS_FILE" ]] && chmod 600 "$EXTERNAL_LINKS_FILE" 2>/dev/null || true
+    [[ -f "$EXTERNAL_SUBS_FILE" ]] && chmod 600 "$EXTERNAL_SUBS_FILE" 2>/dev/null || true
+    if [[ -d "$EXTERNAL_CACHE_DIR" ]]; then
+        chmod 700 "$EXTERNAL_CACHE_DIR" 2>/dev/null || true
+        find "$EXTERNAL_CACHE_DIR" -type f -exec chmod 600 {} + 2>/dev/null || true
+    fi
+}
+
+# 订阅抓取：默认校验 TLS 证书
+# 如需兼容自签证书订阅源，可显式设置: VLESS_SUB_TLS_VERIFY=false 或 VLESS_SUB_TLS_INSECURE=true
 _fetch_sub_content() {
     local url="$1"
     local max_time="${2:-30}"
     local -a args=(-sL --connect-timeout 10 --max-time "$max_time")
-    [[ "${VLESS_SUB_TLS_VERIFY:-false}" != "true" ]] && args+=(-k)
+    if [[ "${VLESS_SUB_TLS_INSECURE:-false}" == "true" || "${VLESS_SUB_TLS_VERIFY:-true}" == "false" ]]; then
+        args+=(-k)
+    fi
     curl "${args[@]}" "$url" 2>/dev/null
 }
 
@@ -13394,6 +13601,7 @@ refresh_external_subs() {
     [[ ! -f "$EXTERNAL_SUBS_FILE" ]] && return 0
     
     mkdir -p "$EXTERNAL_CACHE_DIR"
+    chmod 700 "$EXTERNAL_CACHE_DIR" 2>/dev/null || true
     local count=0
     local idx=0
     
@@ -13406,6 +13614,7 @@ refresh_external_subs() {
         
         if [[ -n "$content" ]]; then
             echo "$content" > "$EXTERNAL_CACHE_DIR/sub_$idx.txt"
+            chmod 600 "$EXTERNAL_CACHE_DIR/sub_$idx.txt" 2>/dev/null || true
             local node_count=$(echo "$content" | grep -c '://' || echo 0)
             _ok "获取 $node_count 个节点"
             ((count+=node_count))
@@ -13413,6 +13622,7 @@ refresh_external_subs() {
             _warn "拉取失败: $url"
         fi
     done < "$EXTERNAL_SUBS_FILE"
+    secure_external_nodes_storage
     
     _ok "共刷新 $count 个外部节点"
     
@@ -13725,6 +13935,7 @@ add_external_link() {
     # 保存
     mkdir -p "$(dirname "$EXTERNAL_LINKS_FILE")"
     echo "$link" >> "$EXTERNAL_LINKS_FILE"
+    secure_external_nodes_storage
     
     _ok "已添加节点: $name"
     
@@ -13775,8 +13986,10 @@ add_external_sub() {
     
     # 缓存节点
     mkdir -p "$EXTERNAL_CACHE_DIR"
+    chmod 700 "$EXTERNAL_CACHE_DIR" 2>/dev/null || true
     local idx=$(wc -l < "$EXTERNAL_SUBS_FILE" 2>/dev/null || echo 1)
     echo "$content" > "$EXTERNAL_CACHE_DIR/sub_$idx.txt"
+    secure_external_nodes_storage
     
     _ok "已添加订阅，包含 $node_count 个节点"
     
@@ -13861,7 +14074,7 @@ delete_external_node() {
             read -rp "  输入序号删除 (0 取消): " del_idx
             [[ "$del_idx" == "0" || -z "$del_idx" ]] && return
             
-            sed -i "${del_idx}d" "$EXTERNAL_LINKS_FILE" 2>/dev/null && _ok "已删除" || _err "删除失败"
+            sed -i "${del_idx}d" "$EXTERNAL_LINKS_FILE" 2>/dev/null && { secure_external_nodes_storage; _ok "已删除"; } || _err "删除失败"
             # 自动更新订阅文件
             [[ -f "$CFG/sub.info" ]] && generate_sub_files
             ;;
@@ -13880,6 +14093,7 @@ delete_external_node() {
             
             sed -i "${del_idx}d" "$EXTERNAL_SUBS_FILE" 2>/dev/null
             rm -f "$EXTERNAL_CACHE_DIR/sub_$del_idx.txt" 2>/dev/null
+            secure_external_nodes_storage
             _ok "已删除"
             # 自动更新订阅文件
             [[ -f "$CFG/sub.info" ]] && generate_sub_files
@@ -14279,13 +14493,13 @@ log-level: debug
 mode: rule
 ipv6: true
 mixed-port: 7890
-allow-lan: true
-bind-address: "*"
+allow-lan: false
+bind-address: "127.0.0.1"
 lan-allowed-ips:
   - 0.0.0.0/0
   - ::/0
 find-process-mode: strict
-external-controller: 0.0.0.0:9090
+external-controller: 127.0.0.1:9090
 
 geox-url:
   geoip: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat"
@@ -14318,7 +14532,7 @@ sniffer:
 dns:
   enable: true
   prefer-h3: false
-  listen: 0.0.0.0:1053
+  listen: 127.0.0.1:1053
   ipv6: true
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
@@ -14948,7 +15162,7 @@ generate_sub_files() {
     # Sing-box 订阅
     gen_singbox_sub > "$sub_dir/singbox.json"
     
-    chmod -R 644 "$sub_dir"/*
+    secure_subscription_permissions "$sub_dir"
     _ok "订阅文件已生成"
 }
 
@@ -15096,7 +15310,7 @@ show_sub_links() {
     
     # 清除变量避免污染
     local sub_uuid="" sub_port="" sub_domain="" sub_https=""
-    source "$CFG/sub.info"
+    load_sub_info || { _warn "订阅配置读取失败"; return; }
     local ipv4=$(get_ipv4)
     
     # 计算基础 URL (显式保留所有端口)
@@ -15158,7 +15372,7 @@ manage_subscription() {
         if [[ -f "$CFG/sub.info" ]]; then
             # 清除变量避免污染
             local sub_uuid="" sub_port="" sub_domain="" sub_https=""
-            source "$CFG/sub.info"
+            load_sub_info || true
             echo -e "  状态: ${G}已配置${NC}"
             echo -e "  端口: ${G}$sub_port${NC}"
             [[ -n "$sub_domain" ]] && echo -e "  域名: ${G}$sub_domain${NC}"
@@ -15202,12 +15416,7 @@ manage_subscription() {
                         if create_fake_website "$conf_name" "$conf_name" "$new_sub_port"; then
                             sub_port="$new_sub_port"
                             # 更新 sub.info (虽然 create_fake_website 内部也会更新，这里手动确保变量一致)
-                            cat > "$CFG/sub.info" << EOF
-sub_uuid=$sub_uuid
-sub_port=$sub_port
-sub_domain=$sub_domain
-sub_https=$sub_https
-EOF
+                            write_sub_info "$sub_uuid" "$sub_port" "$sub_domain" "$sub_https"
                             _ok "订阅端口已成功更新并刷新 Nginx"
                         else
                             # 如果全量模式失败，尝试基础模式
@@ -15227,18 +15436,13 @@ EOF
                     local refresh_port=""
                     [[ -f "$CFG/sub.info" ]] && {
                         local _s_uuid="" _s_port="" _s_domain="" _s_https=""
-                        source "$CFG/sub.info"
+                        load_sub_info || true
                         refresh_port="${sub_port}"
                     }
                     if setup_nginx_sub "$refresh_port" "$sub_domain" "auto"; then
                         local actual_https="false"
                         subscription_cert_available "$sub_domain" && actual_https="true"
-                        cat > "$CFG/sub.info" << EOF
-sub_uuid=$sub_uuid
-sub_port=$refresh_port
-sub_domain=$sub_domain
-sub_https=$actual_https
-EOF
+                        write_sub_info "$sub_uuid" "$refresh_port" "$sub_domain" "$actual_https"
                         rebuild_and_reload_xray "silent"
                         rebuild_and_reload_singbox "silent"
                         _ok "Nginx 订阅服务已按当前证书状态刷新，核心服务已重载"
@@ -15254,12 +15458,7 @@ EOF
                     if setup_nginx_sub "$sub_port" "$sub_domain" "auto"; then
                         local actual_https="false"
                         subscription_cert_available "$sub_domain" && actual_https="true"
-                        cat > "$CFG/sub.info" << EOF
-sub_uuid=$sub_uuid
-sub_port=$sub_port
-sub_domain=$sub_domain
-sub_https=$actual_https
-EOF
+                        write_sub_info "$sub_uuid" "$sub_port" "$sub_domain" "$actual_https"
                         rebuild_and_reload_xray "silent"
                         rebuild_and_reload_singbox "silent"
                         _ok "订阅证书配置已应用，Nginx 已刷新"
@@ -15273,7 +15472,11 @@ EOF
                     if [[ -f "$CFG/sub.info" ]]; then
                         local s_uuid="" s_port="" s_domain="" s_https=""
                         # 临时读取以获取域名用于定位文件名
-                        source "$CFG/sub.info"
+                        load_sub_info || true
+                        s_uuid="$sub_uuid"
+                        s_port="$sub_port"
+                        s_domain="$sub_domain"
+                        s_https="$sub_https"
                         local c_name="${s_domain:-vless-server}"
                         [[ "$s_domain" == "localhost" || -z "$s_domain" ]] && c_name="vless-server"
                         
@@ -15329,7 +15532,7 @@ manage_fb_port() {
         local cur_sub_port="2086"
         [[ -f "$CFG/sub.info" ]] && {
             local sub_uuid="" sub_port="" sub_domain="" sub_https=""
-            source "$CFG/sub.info"
+            load_sub_info || true
             cur_sub_port="$sub_port"
         }
         
@@ -15432,12 +15635,7 @@ setup_subscription_interactive() {
     subscription_cert_available "$sub_domain" && actual_https="true"
 
     # 保存订阅信息到 sub.info (保持原有逻辑兼容)
-    cat > "$CFG/sub.info" << EOF
-sub_uuid=$sub_uuid
-sub_port=$sub_port
-sub_domain=$sub_domain
-sub_https=$actual_https
-EOF
+    write_sub_info "$sub_uuid" "$sub_port" "$sub_domain" "$actual_https"
     
     echo ""
     _ok "订阅服务部署成功"
@@ -16437,9 +16635,9 @@ do_update() {
     local tmp_file=$(mktemp)
     
     # 下载最新脚本
-    if ! curl -sL --connect-timeout 10 -o "$tmp_file" "$raw_url"; then
+    if ! curl -fsSL --connect-timeout 10 -o "$tmp_file" "$raw_url" || ! validate_downloaded_script "$tmp_file"; then
         rm -f "$tmp_file"
-        _err "下载失败，请检查网络连接"
+        _err "下载失败或远程脚本校验未通过"
         return 1
     fi
     

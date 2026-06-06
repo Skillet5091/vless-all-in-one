@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.0.1 [客户端]
+#  多协议代理一键部署脚本 v3.0.2 [客户端]
 #  支持协议: VLESS+Reality / VLESS+Reality+XHTTP / VLESS+WS / VMess+WS / 
 #           VLESS-XTLS-Vision / SOCKS5 / SS2022 / HY2 / Trojan / 
 #           AnyTLS / TUIC / SS2022+ShadowTLS (共12种)
@@ -13,7 +13,7 @@
 #  项目地址: https://github.com/Chil30/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.0.1"
+readonly VERSION="3.0.2"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://github.com/Chil30/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -118,6 +118,68 @@ check_root()      { [[ $EUID -ne 0 ]] && { _err "请使用 root 权限运行"; e
 check_cmd()       { command -v "$1" &>/dev/null; }
 check_installed() { [[ -d "$CFG" && ( -f "$CFG/config.json" || -f "$CFG/config.yaml" || -f "$CFG/hy2.yaml" || -f "$CFG/config.conf" || -f "$CFG/info" ) ]]; }
 get_role()        { [[ -f "$CFG/role" ]] && cat "$CFG/role" || echo ""; }
+
+_is_info_key() {
+    case "$1" in
+        protocol|server_ip|port|uuid|public_key|short_id|sni|path|service_name|username|password|method|psk|version|cert_path|stls_password|ss_backend_port)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+sanitize_kv_file() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    local tmp; tmp=$(mktemp) || return 1
+    local line key val
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line//$'\r'/}"
+        [[ "$line" != *=* ]] && continue
+        key="${line%%=*}"
+        val="${line#*=}"
+        _is_info_key "$key" || continue
+        printf '%s=%s\n' "$key" "$val" >> "$tmp"
+    done < "$file"
+    mv "$tmp" "$file"
+    chmod 600 "$file" 2>/dev/null
+}
+
+load_info_file() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    local key
+    for key in protocol server_ip port uuid public_key short_id sni path service_name username password method psk version cert_path stls_password ss_backend_port; do
+        printf -v "$key" '%s' ""
+    done
+    local line val
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line//$'\r'/}"
+        [[ "$line" != *=* ]] && continue
+        key="${line%%=*}"
+        val="${line#*=}"
+        _is_info_key "$key" || continue
+        printf -v "$key" '%s' "$val"
+    done < "$file"
+}
+
+sanitize_node_name() {
+    local name="$1"
+    name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_' | sed 's/^_*//; s/_*$//')
+    [[ -n "$name" ]] && printf '%s\n' "$name"
+}
+
+list_node_files() {
+    [[ -d "$CFG/nodes" ]] || return 1
+    find "$CFG/nodes" -maxdepth 1 -type f -name '*.info' | sort
+}
+
+secure_client_config_files() {
+    local file
+    chmod 700 "$CFG" 2>/dev/null || true
+    for file in "$CFG/info" "$CFG/config.json" "$CFG/config.yaml" "$CFG/hy2.yaml" "$CFG/config.conf"; do
+        [[ -f "$file" ]] && chmod 600 "$file" 2>/dev/null
+    done
+}
 get_mode()        { [[ -f "$CFG/mode" ]] && cat "$CFG/mode" || echo "tun"; }
 is_paused()       { [[ -f "$CFG/paused" ]]; }
 
@@ -426,6 +488,7 @@ gen_client_config() {
     shift
     local mode=$(get_mode)
     mkdir -p "$CFG"
+    chmod 700 "$CFG" 2>/dev/null || true
 
     local inbounds='[{"port": '$SOCKS_PORT', "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": true}}]'
     [[ "$mode" == "global" ]] && inbounds='[
@@ -783,6 +846,8 @@ EOF
             ;;
     esac
     
+    sanitize_kv_file "$CFG/info"
+    secure_client_config_files
     echo "client" > "$CFG/role"
     echo "$protocol_type" > "$CFG/protocol"
     register_protocol "$protocol_type"
@@ -1423,14 +1488,19 @@ show_status() {
 # 节点管理
 #═══════════════════════════════════════════════════════════════════════════════
 save_node() {
-    local name="$1"
+    local name
+    name=$(sanitize_node_name "$1")
+    [[ -z "$name" ]] && { _err "节点名称无效"; return 1; }
     mkdir -p "$CFG/nodes"
+    chmod 700 "$CFG/nodes" 2>/dev/null || true
     
     if [[ -f "$CFG/info" ]]; then
+        sanitize_kv_file "$CFG/info"
         cp "$CFG/info" "$CFG/nodes/${name}.info"
         [[ -f "$CFG/config.json" ]] && cp "$CFG/config.json" "$CFG/nodes/${name}.json"
         [[ -f "$CFG/hy2.yaml" ]] && cp "$CFG/hy2.yaml" "$CFG/nodes/${name}.yaml"
         [[ -f "$CFG/config.conf" ]] && cp "$CFG/config.conf" "$CFG/nodes/${name}.conf"
+        chmod 600 "$CFG/nodes/${name}."* 2>/dev/null
         _ok "节点 [$name] 保存成功"
     else
         _err "没有可保存的配置"
@@ -1441,10 +1511,11 @@ list_nodes() {
     [[ ! -d "$CFG/nodes" ]] && { _warn "没有保存的节点"; return 1; }
     local current=$(cat "$CFG/current_node" 2>/dev/null) i=1
     local has_nodes=false
-    for node in "$CFG/nodes"/*; do
+    local node
+    while IFS= read -r node; do
         [[ ! -f "$node" ]] && continue
         has_nodes=true
-        source "$node"
+        load_info_file "$node" || continue
         local name=$(basename "$node")
         local proto_type="${protocol:-vless}"
         local mark="" latency=$(test_latency "$server_ip" "$port" "$proto_type")
@@ -1474,7 +1545,7 @@ list_nodes() {
         
         printf "  ${G}%2d${NC}) %-20s ${D}[%s]${NC} ${D}(%s:%s)${NC} ${color}%s${NC}%b\n" "$i" "$name" "$proto_short" "$server_ip" "$port" "$latency" "$mark"
         ((i++))
-    done
+    done < <(list_node_files)
     [[ "$has_nodes" == "false" ]] && { _warn "没有保存的节点"; return 1; }
     return 0
 }
@@ -1482,7 +1553,7 @@ list_nodes() {
 switch_node() {
     local node_file="$1"
     [[ ! -f "$node_file" ]] && return 1
-    source "$node_file"
+    load_info_file "$node_file" || return 1
     
     _info "切换到节点: $(basename "$node_file")"
     stop_services
@@ -1544,19 +1615,22 @@ select_node() {
     fi
     _line
     echo ""
-    local max=$(ls "$CFG/nodes" 2>/dev/null | wc -l)
+    local files=()
+    mapfile -t files < <(list_node_files)
+    local max=${#files[@]}
+    [[ $max -eq 0 ]] && { _warn "没有保存的节点"; return 1; }
     read -rp "  $prompt [1-$max]: " choice
     [[ ! "$choice" =~ ^[0-9]+$ ]] && { _err "无效选择"; return 1; }
-    local file=$(ls "$CFG/nodes" 2>/dev/null | sed -n "${choice}p")
-    [[ -z "$file" ]] && { _err "节点不存在"; return 1; }
-    SELECTED_NODE="$CFG/nodes/$file"
+    [[ "$choice" -lt 1 || "$choice" -gt "$max" ]] && { _err "节点不存在"; return 1; }
+    SELECTED_NODE="${files[$((choice-1))]}"
     return 0
 }
 
 delete_node() {
     select_node "选择要删除的节点" || return
     local name=$(basename "$SELECTED_NODE")
-    rm -f "$SELECTED_NODE"
+    local base="${SELECTED_NODE%.info}"
+    rm -f "$base.info" "$base.json" "$base.yaml" "$base.conf"
     _ok "节点 [$name] 已删除"
 }
 
@@ -1900,6 +1974,15 @@ EOF
 #═══════════════════════════════════════════════════════════════════════════════
 # 更新
 #═══════════════════════════════════════════════════════════════════════════════
+validate_downloaded_script() {
+    local file="$1"
+    [[ -s "$file" ]] || return 1
+    head -n 1 "$file" | grep -qE '^#!/(usr/bin/env[[:space:]]+)?bash|^#!/bin/bash' || return 1
+    grep -q '^readonly VERSION="' "$file" || return 1
+    grep -q 'vless-all-in-one' "$file" || return 1
+    bash -n "$file" >/dev/null 2>&1
+}
+
 do_update() {
     _header
     echo -e "  ${W}脚本更新${NC}"
@@ -1911,9 +1994,9 @@ do_update() {
     local remote_url="https://raw.githubusercontent.com/Chil30/vless-all-in-one/main/vless-client.sh"
     local tmp_file=$(mktemp)
     
-    if ! curl -sL --connect-timeout 10 -o "$tmp_file" "$remote_url" || [[ ! -s "$tmp_file" ]]; then
+    if ! curl -fsSL --connect-timeout 10 -o "$tmp_file" "$remote_url" || ! validate_downloaded_script "$tmp_file"; then
         rm -f "$tmp_file"
-        _err "下载失败，请检查网络连接"
+        _err "下载失败或远程脚本校验未通过"
         return 1
     fi
     
@@ -2001,7 +2084,7 @@ switch_mode() {
     # 重新生成配置
     if [[ -f "$CFG/info" ]]; then
         local protocol=$(get_protocol)
-        source "$CFG/info"
+        load_info_file "$CFG/info" || return 1
         
         # 根据协议重新生成客户端配置
         case "$protocol" in
@@ -2085,7 +2168,7 @@ show_config() {
     echo -e "  ${W}当前配置${NC}"
     _line
     
-    source "$CFG/info"
+    load_info_file "$CFG/info" || return 1
     
     echo -e "  协议: ${G}$(get_protocol_name $protocol)${NC}"
     echo -e "  服务器: ${C}$server_ip${NC}"

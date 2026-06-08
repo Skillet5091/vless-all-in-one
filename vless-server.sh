@@ -14495,6 +14495,8 @@ ipv6: true
 mixed-port: 7890
 allow-lan: false
 bind-address: "127.0.0.1"
+tls:
+  skip-cert-verify: true
 lan-allowed-ips:
   - 0.0.0.0/0
   - ::/0
@@ -14543,12 +14545,15 @@ dns:
     - "localhost.ptlogin2.qq.com"
   use-hosts: true
   nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+    - 9.9.9.9
     - https://1.1.1.1/dns-query
     - https://8.8.8.8/dns-query
     - https://dns.quad9.net/dns-query
+  proxy-server-nameserver:
     - 1.1.1.1
     - 8.8.8.8
-  proxy-server-nameserver:
     - https://1.1.1.1/dns-query
     - https://8.8.8.8/dns-query
   skip-cert-verify: true
@@ -14660,6 +14665,7 @@ rule-providers:
     interval: 86400
     url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Lan/Lan.yaml
     path: ./Rules/lan.yaml
+    skip-cert-verify: true
   reject:
     type: http
     behavior: domain
@@ -14667,6 +14673,7 @@ rule-providers:
     url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/reject.txt
     path: ./ruleset/reject.yaml
     interval: 86400
+    skip-cert-verify: true
   proxy:
     type: http
     behavior: domain
@@ -14674,6 +14681,7 @@ rule-providers:
     url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/proxy.txt
     path: ./ruleset/proxy.yaml
     interval: 86400
+    skip-cert-verify: true
   direct:
     type: http
     behavior: domain
@@ -14681,6 +14689,7 @@ rule-providers:
     url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/direct.txt
     path: ./ruleset/direct.yaml
     interval: 86400
+    skip-cert-verify: true
   private:
     type: http
     behavior: domain
@@ -14688,6 +14697,7 @@ rule-providers:
     url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/private.txt
     path: ./ruleset/private.yaml
     interval: 86400
+    skip-cert-verify: true
   gfw:
     type: http
     behavior: domain
@@ -14695,6 +14705,7 @@ rule-providers:
     url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/gfw.txt
     path: ./ruleset/gfw.yaml
     interval: 86400
+    skip-cert-verify: true
   greatfire:
     type: http
     behavior: domain
@@ -14702,6 +14713,7 @@ rule-providers:
     url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/greatfire.txt
     path: ./ruleset/greatfire.yaml
     interval: 86400
+    skip-cert-verify: true
   tld-not-cn:
     type: http
     behavior: domain
@@ -14709,12 +14721,14 @@ rule-providers:
     url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/tld-not-cn.txt
     path: ./ruleset/tld-not-cn.yaml
     interval: 86400
+    skip-cert-verify: true
   telegram:
     type: http
     behavior: classical
     url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Telegram/Telegram.yaml
     path: ./ruleset/telegram.yaml
     interval: 86400
+    skip-cert-verify: true
   telegramcidr:
     type: http
     behavior: ipcidr
@@ -14722,6 +14736,7 @@ rule-providers:
     url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/telegramcidr.txt
     path: ./ruleset/telegramcidr.yaml
     interval: 86400
+    skip-cert-verify: true
   applications:
     type: http
     behavior: classical
@@ -14729,78 +14744,91 @@ rule-providers:
     url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/applications.txt
     path: ./ruleset/applications.yaml
     interval: 86400
+    skip-cert-verify: true
   Disney:
     type: http
     behavior: classical
     url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Disney/Disney.yaml
     path: ./ruleset/disney.yaml
     interval: 86400
+    skip-cert-verify: true
   Netflix:
     type: http
     behavior: classical
     url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Netflix/Netflix.yaml
     path: ./ruleset/netflix.yaml
     interval: 86400
+    skip-cert-verify: true
   YouTube:
     type: http
     behavior: classical
     url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/YouTube/YouTube.yaml
     path: ./ruleset/youtube.yaml
     interval: 86400
+    skip-cert-verify: true
   HBO:
     type: http
     behavior: classical
     url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/HBO/HBO.yaml
     path: ./ruleset/hbo.yaml
     interval: 86400
+    skip-cert-verify: true
   OpenAI:
     type: http
     behavior: classical
     url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/OpenAI/OpenAI.yaml
     path: ./ruleset/openai.yaml
     interval: 86400
+    skip-cert-verify: true
   ClaudeAI:
     type: http
     behavior: classical
     url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Claude/Claude.yaml
     path: ./ruleset/claudeai.yaml
     interval: 86400
+    skip-cert-verify: true
   Bing:
     type: http
     behavior: classical
     url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Bing/Bing.yaml
     path: ./ruleset/bing.yaml
     interval: 86400
+    skip-cert-verify: true
   Google:
     type: http
     behavior: classical
     url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Google/Google.yaml
     path: ./ruleset/google.yaml
     interval: 86400
+    skip-cert-verify: true
   GitHub:
     type: http
     behavior: classical
     url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/GitHub/GitHub.yaml
     path: ./ruleset/github.yaml
     interval: 86400
+    skip-cert-verify: true
   Spotify:
     type: http
     behavior: classical
     url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Spotify/Spotify.yaml
     path: ./ruleset/spotify.yaml
     interval: 86400
+    skip-cert-verify: true
   ChinaMaxDomain:
     type: http
     behavior: domain
     interval: 86400
     url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/ChinaMax/ChinaMax_Domain.yaml
     path: ./Rules/ChinaMaxDomain.yaml
+    skip-cert-verify: true
   ChinaMaxIPNoIPv6:
     type: http
     behavior: ipcidr
     interval: 86400
     url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/ChinaMax/ChinaMax_IP_No_IPv6.yaml
     path: ./Rules/ChinaMaxIPNoIPv6.yaml
+    skip-cert-verify: true
 
 
 

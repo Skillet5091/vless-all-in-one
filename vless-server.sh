@@ -14545,15 +14545,17 @@ dns:
   nameserver:
     - https://1.1.1.1/dns-query
     - https://8.8.8.8/dns-query
+    - https://dns.quad9.net/dns-query
     - 1.1.1.1
     - 8.8.8.8
   proxy-server-nameserver:
-    - https://223.5.5.5/dns-query
-    - https://1.12.12.12/dns-query
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
+  skip-cert-verify: true
   nameserver-policy:
     "geosite:cn,private":
-      - https://doh.pub/dns-query
-      - https://dns.alidns.com/dns-query
+      - 119.29.29.29
+      - 223.5.5.5
 
 proxies:
 $proxies

@@ -20,7 +20,7 @@
 
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.6.1"
+readonly VERSION="3.7.0"
 readonly AUTHOR="Skillet5091"
 readonly REPO_URL="https://github.com/Skillet5091/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -7477,6 +7477,7 @@ uninstall_warp() {
 # 预设规则类型定义
 declare -A ROUTING_PRESETS=(
     [AI]="openai.com,chatgpt.com,chat.openai.com,ai.com,sora.com,oaistatic.com,oaiusercontent.com,gemini.google.com"
+    [grok]="x.ai,grok.com"
     [netflix]="netflix.com,netflix.net,nflximg.net,nflximg.com,nflxvideo.net,nflxso.net,nflxext.com"
     [disney]="disney.com,disneyplus.com,dssott.com,bamgrid.com,disney-plus.net,disneystreaming.com"
     [youtube]="youtube.com,googlevideo.com,ytimg.com,youtu.be,yt.be,youtube-nocookie.com"
@@ -7492,6 +7493,7 @@ declare -A ROUTING_PRESETS=(
 # 预设规则显示名称
 declare -A ROUTING_PRESET_NAMES=(
     [AI]="AI相关"
+    [grok]="xAI/Grok"
     [netflix]="Netflix"
     [disney]="Disney+"
     [youtube]="YouTube"
@@ -8073,6 +8075,7 @@ _add_routing_rule() {
     _item "6" "TikTok"
     _item "7" "Telegram"
     _item "8" "Google"
+    _item "g" "xAI/Grok"
     _item "9" "自定义域名"
     _item "a" "所有流量"
     _item "0" "返回"
@@ -8090,6 +8093,7 @@ _add_routing_rule() {
         6) rule_type="tiktok" ;;
         7) rule_type="telegram" ;;
         8) rule_type="google" ;;
+        g|G) rule_type="grok" ;;
         9)
             rule_type="custom"
             echo ""

@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.6.1[服务端]
+#  多协议代理一键部署脚本 v3.7.1[服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -20,7 +20,7 @@
 
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.0"
+readonly VERSION="3.7.1"
 readonly AUTHOR="Skillet5091"
 readonly REPO_URL="https://github.com/Skillet5091/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -7362,37 +7362,103 @@ install_warp_auto_rotate() {
     local interval_min="${1:-15}"
 
     if ! check_cmd warp-cli; then
-        _err "warp-cli 未安装，无法开启自动切换 IP"
+        _err "warp-cli 未安装，无法开启 WARP 健康检查"
         return 1
     fi
 
     cat > /usr/local/bin/warp-auto-rotate <<'EOF'
 #!/usr/bin/env bash
-set -euo pipefail
-warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+set -u
+
+# Do not rotate a healthy WARP egress. Reconnecting destroys long-lived
+# Twitter/X streams, so only recover after repeated failed health checks.
+readonly PROXY="127.0.0.1:40000"
+readonly TRACE_URL="https://www.cloudflare.com/cdn-cgi/trace"
+readonly REQUIRED_COUNTRY="${WARP_REQUIRED_COUNTRY:-US}"
+readonly STATE_FILE="/run/warp-egress-guard.state"
+readonly MIN_RECONNECT_INTERVAL=1800
+
+exec 9>/run/warp-egress-guard.lock
+flock -n 9 || exit 0
+
+check_egress() {
+    local trace country warp ip
+
+    trace=$(curl -fsS --connect-timeout 4 --max-time 8 \
+        --socks5-hostname "$PROXY" "$TRACE_URL" 2>/dev/null) || return 1
+    country=$(awk -F= '$1 == "loc" {print $2}' <<<"$trace")
+    warp=$(awk -F= '$1 == "warp" {print $2}' <<<"$trace")
+    ip=$(awk -F= '$1 == "ip" {print $2}' <<<"$trace")
+
+    case "$warp" in
+        on|plus) ;;
+        *) return 1 ;;
+    esac
+    [[ -z "$REQUIRED_COUNTRY" || "$country" == "$REQUIRED_COUNTRY" ]] || return 1
+    echo "WARP egress healthy: country=$country warp=$warp ip=$ip"
+}
+
+last_failure=0
+failures=0
+last_reconnect=0
+if [[ -r "$STATE_FILE" ]]; then
+    read -r last_failure failures last_reconnect < "$STATE_FILE" || true
+fi
+[[ "$last_failure" =~ ^[0-9]+$ ]] || last_failure=0
+[[ "$failures" =~ ^[0-9]+$ ]] || failures=0
+[[ "$last_reconnect" =~ ^[0-9]+$ ]] || last_reconnect=0
+
+# A single failed probe can be a transient HTTP or DNS failure. Three probes
+# in one run plus two consecutive timer runs are required before recovery.
+for attempt in 1 2 3; do
+    if check_egress; then
+        rm -f "$STATE_FILE"
+        exit 0
+    fi
+    [[ "$attempt" -lt 3 ]] && sleep 2
+done
+
+now=$(date +%s)
+if (( now - last_reconnect < MIN_RECONNECT_INTERVAL )); then
+    echo "WARP egress probe failed; reconnect cooldown is active" >&2
+    printf '%s %s %s\n' "$now" "$((failures + 1))" "$last_reconnect" > "$STATE_FILE"
+    exit 0
+fi
+
+if (( failures < 2 )); then
+    printf '%s %s %s\n' "$now" "$((failures + 1))" "$last_reconnect" > "$STATE_FILE"
+    echo "WARP egress probe failed; waiting for another timer run before reconnect" >&2
+    exit 0
+fi
+
+echo "WARP egress unhealthy; reconnecting after repeated failures" >&2
+timeout 15 warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
 sleep 2
-warp-cli --accept-tos connect >/dev/null 2>&1 || true
+timeout 15 warp-cli --accept-tos connect >/dev/null 2>&1 || true
+printf '%s 0 %s\n' "$now" "$now" > "$STATE_FILE"
 EOF
     chmod +x /usr/local/bin/warp-auto-rotate
 
     cat > /etc/systemd/system/warp-auto-rotate.service <<EOF
 [Unit]
-Description=WARP Auto Rotate IP
+Description=WARP Egress Health Guard (no periodic IP rotation)
 After=network-online.target warp-svc.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/warp-auto-rotate
+TimeoutStartSec=90
 EOF
 
     cat > /etc/systemd/system/warp-auto-rotate.timer <<EOF
 [Unit]
-Description=Run WARP auto rotate periodically
+Description=Check WARP egress health periodically
 
 [Timer]
 OnBootSec=5min
 OnUnitActiveSec=${interval_min}min
+RandomizedDelaySec=30s
 Unit=warp-auto-rotate.service
 
 [Install]
@@ -7401,7 +7467,7 @@ EOF
 
     systemctl daemon-reload
     systemctl enable --now warp-auto-rotate.timer >/dev/null 2>&1
-    _ok "WARP 自动切换 IP 已开启 (每 ${interval_min} 分钟)"
+    _ok "WARP 健康检查已开启 (每 ${interval_min} 分钟，仅连续故障时重连)"
 }
 
 uninstall_warp_auto_rotate() {
@@ -7409,8 +7475,9 @@ uninstall_warp_auto_rotate() {
     rm -f /etc/systemd/system/warp-auto-rotate.timer
     rm -f /etc/systemd/system/warp-auto-rotate.service
     rm -f /usr/local/bin/warp-auto-rotate
+    rm -f /run/warp-egress-guard.state /run/warp-egress-guard.lock
     systemctl daemon-reload
-    _ok "WARP 自动切换 IP 已关闭"
+    _ok "WARP 健康检查已关闭"
 }
 
 warp_auto_rotate_status() {
@@ -8264,8 +8331,8 @@ manage_warp() {
             _item "1" "切换到 WGCF 模式"
             _item "2" "重新连接官方客户端"
             _item "3" "测试 WARP 连接"
-            _item "4" "开启自动切换 IP (15分钟)"
-            _item "5" "关闭自动切换 IP"
+            _item "4" "开启 WARP 健康检查 (15分钟)"
+            _item "5" "关闭 WARP 健康检查"
             _item "6" "卸载官方客户端"
         else
             _item "1" "切换到官方客户端模式"

@@ -1,4 +1,4 @@
-﻿# 多协议代理一键部署脚本 v3.7.1
+# 多协议代理一键部署脚本 v3.7.2
 
 一个强大且智能的多协议代理部署脚本，支持 **13 种主流协议**，具备 **Smart Fallback 端口复用 (443)**、**CDN 自动匹配**、**高级伪装网** 等前沿特性。
 
@@ -433,8 +433,21 @@ apk add curl jq unzip iproute2 nginx
 │       ├── surge.conf    # Surge 订阅
 │       └── base64        # V2Ray 订阅
 ├── certs/                # 证书目录
+├── warp.json             # WARP 相关材料（若启用）
 └── ...
+
+# WARP 官方客户端 + 出口健康检查（可选运维组件）
+/usr/local/bin/warp-auto-rotate              # 健康检查 / 故障恢复 / 条件换口
+/etc/systemd/system/warp-auto-rotate.service
+/etc/systemd/system/warp-auto-rotate.timer
+/var/log/warp-egress-guard.log
+/run/warp-egress-guard.state                  # 或 /var/run/...
+/run/warp-egress-guard.lock
+/etc/systemd/system/warp-svc.service.d/memory-guard.conf
 ```
+
+> 📌 **WARP 出口健康检查完整说明 / 移除清单**：见仓库根目录 [`WARP-EGRESS-GUARD.md`](./WARP-EGRESS-GUARD.md)
+> 未来若要关闭或删除该组件，务必按该文档第 5 节清单操作，避免遗漏 timer、日志、备份文件。
 
 ---
 
@@ -467,6 +480,13 @@ MIT License
 ---
 
 ## 📝 更新日志
+
+### v3.7.2 (2026-07-25)
+
+- 📘 **WARP 出口健康检查运维文档**
+  - 新增 `WARP-EGRESS-GUARD.md`：记录 `warp-auto-rotate` 路径、行为、环境变量与**完整移除清单**
+  - README 文件位置补充 WARP 相关路径，避免后续清理遗漏
+  - `uninstall_warp_auto_rotate` 同步清理日志、state/lock 与 `.bak` 备份
 
 ### v3.7.1 (2026-07-21)
 

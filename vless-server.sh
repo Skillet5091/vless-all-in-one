@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.7.1[服务端]
+#  多协议代理一键部署脚本 v3.7.2[服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -20,7 +20,7 @@
 
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.1"
+readonly VERSION="3.7.2"
 readonly AUTHOR="Skillet5091"
 readonly REPO_URL="https://github.com/Skillet5091/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -7471,13 +7471,21 @@ EOF
 }
 
 uninstall_warp_auto_rotate() {
+    # Full removal checklist is documented in WARP-EGRESS-GUARD.md
     systemctl disable --now warp-auto-rotate.timer >/dev/null 2>&1 || true
+    systemctl stop warp-auto-rotate.service >/dev/null 2>&1 || true
+    systemctl reset-failed warp-auto-rotate.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/warp-auto-rotate.timer
     rm -f /etc/systemd/system/warp-auto-rotate.service
+    rm -f /etc/systemd/system/warp-auto-rotate.timer.bak.*
+    rm -f /etc/systemd/system/warp-auto-rotate.service.bak.*
     rm -f /usr/local/bin/warp-auto-rotate
-    rm -f /run/warp-egress-guard.state /run/warp-egress-guard.lock
+    rm -f /usr/local/bin/warp-auto-rotate.bak.*
+    rm -f /run/warp-egress-guard.state /var/run/warp-egress-guard.state
+    rm -f /run/warp-egress-guard.lock /var/run/warp-egress-guard.lock
+    rm -f /var/log/warp-egress-guard.log
     systemctl daemon-reload
-    _ok "WARP 健康检查已关闭"
+    _ok "WARP 健康检查已关闭（含日志/state/备份）"
 }
 
 warp_auto_rotate_status() {

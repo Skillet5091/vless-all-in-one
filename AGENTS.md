@@ -51,3 +51,15 @@
 4. 每次 `git push` 前必须执行域名扫描并人工确认：
    `git diff --cached | rg -n "([a-zA-Z0-9-]+\\.)+[a-zA-Z]{2,}"`
 5. 发现可疑信息时，立即停止 push，先脱敏/替换后再提交。
+
+## 6. WARP 出口健康检查（运维补丁）
+
+1. 本机可能启用增强版 `warp-auto-rotate`（健康检查 + 故障恢复 + 条件 hard re-register）。
+2. **权威运维文档**：仓库根目录 `WARP-EGRESS-GUARD.md`（含完整文件清单与移除步骤）。
+3. 修改 / 重装 WARP 菜单项后，必须检查 `/usr/local/bin/warp-auto-rotate` 是否被旧版 heredoc 覆盖。
+4. 移除该组件时，除 unit/脚本外，还要清理：
+   - `/var/log/warp-egress-guard.log`
+   - `/run/warp-egress-guard.state`、`/run/warp-egress-guard.lock`（及 `/var/run` 同名路径）
+   - `warp-auto-rotate*.bak*` 备份
+5. 不要把真实 WARP License、registration ID、出口 IP 明文提交进 git。
+

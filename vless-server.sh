@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.7.2[服务端]
+#  多协议代理一键部署脚本 v3.7.3[服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -20,7 +20,7 @@
 
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.2"
+readonly VERSION="3.7.3"
 readonly AUTHOR="Skillet5091"
 readonly REPO_URL="https://github.com/Skillet5091/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -13080,58 +13080,337 @@ install_nginx() {
     fi
 }
 
-# 安全升级 Nginx 软件包：只升级包版本，不改写现有 nginx/订阅配置
-upgrade_nginx_security() {
+# 配置官方软件源；默认 mainline 获取上游最新版，stable 可通过环境变量选择。
+# _NGINX_REPO_URL 由调用方声明，供版本查询复用，禁止回退到发行版旧包。
+_setup_nginx_official_repo() {
+    local channel="$1" work_dir="$2"
+    local base="https://nginx.org/packages" codename release arch fingerprints
+    [[ "$channel" == "mainline" ]] && base+="/mainline"
+
+    case "$DISTRO" in
+        debian|ubuntu)
+            if ! check_cmd curl || ! check_cmd gpg; then
+                apt-get update -qq -o APT::Update::Error-Mode=any || return 1
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                    curl ca-certificates gnupg || return 1
+            fi
+            codename=$(. /etc/os-release; printf '%s' "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}")
+            if [[ -z "$codename" ]] && check_cmd lsb_release; then
+                codename=$(lsb_release -cs) || return 1
+            fi
+            [[ "$codename" =~ ^[a-z][a-z0-9]*$ ]] || return 1
+            arch=$(dpkg --print-architecture) || return 1
+            _NGINX_REPO_URL="$base/$DISTRO"
+            curl -fsSL --connect-timeout "$CURL_TIMEOUT_NORMAL" --max-time "$CURL_TIMEOUT_DOWNLOAD" \
+                "$_NGINX_REPO_URL/dists/$codename/Release" -o "$work_dir/Release" || return 1
+            ;;
+        centos)
+            local pm="yum"
+            check_cmd dnf && pm="dnf"
+            if ! check_cmd curl || ! check_cmd gpg; then
+                "$pm" install -y curl ca-certificates gnupg2 || return 1
+            fi
+            release=$(. /etc/os-release; printf '%s' "${VERSION_ID%%.*}")
+            [[ "$release" =~ ^[0-9]+$ ]] || return 1
+            arch=$(rpm --eval '%{_arch}') || return 1
+            _NGINX_REPO_URL="$base/centos/$release/$arch"
+            curl -fsSL --connect-timeout "$CURL_TIMEOUT_NORMAL" --max-time "$CURL_TIMEOUT_DOWNLOAD" \
+                "$_NGINX_REPO_URL/repodata/repomd.xml" -o "$work_dir/repomd.xml" || return 1
+            ;;
+        alpine)
+            if ! check_cmd curl || ! check_cmd openssl; then
+                apk add --no-cache curl ca-certificates openssl || return 1
+            fi
+            release=$(grep -oE '^[0-9]+\.[0-9]+' /etc/alpine-release) || return 1
+            arch=$(apk --print-arch) || return 1
+            _NGINX_REPO_URL="$base/alpine/v$release/main"
+            curl -fsSL --connect-timeout "$CURL_TIMEOUT_NORMAL" --max-time "$CURL_TIMEOUT_DOWNLOAD" \
+                "$_NGINX_REPO_URL/$arch/APKINDEX.tar.gz" -o "$work_dir/APKINDEX.tar.gz" || return 1
+            curl -fsSL --connect-timeout "$CURL_TIMEOUT_NORMAL" --max-time "$CURL_TIMEOUT_DOWNLOAD" \
+                https://nginx.org/keys/nginx_signing.rsa.pub -o "$work_dir/nginx_signing.rsa.pub" || return 1
+            local key_hash
+            key_hash=$(openssl rsa -pubin -in "$work_dir/nginx_signing.rsa.pub" -outform DER 2>/dev/null | \
+                openssl dgst -sha256 | awk '{print $NF}') || return 1
+            [[ "$key_hash" == "03833138bf6288dcb545f7a154af24f5c63b94931fef6b078cd8061204a44327" ]] || return 1
+            mkdir -p /etc/apk/keys || return 1
+            install -m 644 "$work_dir/nginx_signing.rsa.pub" /etc/apk/keys/nginx_signing.rsa.pub || return 1
+            # 只替换本脚本管理的标签，保留其余仓库，重复更新不会堆积条目。
+            awk '$1 != "@vless_nginx"' /etc/apk/repositories > "$work_dir/repositories" || return 1
+            printf '@vless_nginx %s\n' "$_NGINX_REPO_URL" >> "$work_dir/repositories" || return 1
+            install -m 644 "$work_dir/repositories" /etc/apk/repositories || return 1
+            apk update || return 1
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+
+    curl -fsSL --connect-timeout "$CURL_TIMEOUT_NORMAL" --max-time "$CURL_TIMEOUT_DOWNLOAD" \
+        https://nginx.org/keys/nginx_signing.key -o "$work_dir/nginx_signing.key" || return 1
+    fingerprints=$(gpg --homedir "$work_dir" --batch --show-keys --with-colons \
+        "$work_dir/nginx_signing.key" 2>/dev/null | awk -F: '$1 == "fpr" {print $10}') || return 1
+    # 官方现行签名密钥（包含 2024 年新增密钥），不使用 apt-key 或跳过签名校验。
+    if ! grep -Eq '^(573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62|8540A6F18833A80E9C1653A42FD21310B49F6B46|9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3)$' <<< "$fingerprints"; then
+        _err "Nginx 官方签名密钥指纹不匹配"
+        return 1
+    fi
+
+    if [[ "$DISTRO" == "debian" || "$DISTRO" == "ubuntu" ]]; then
+        gpg --homedir "$work_dir" --batch --yes --dearmor --output "$work_dir/nginx-keyring.gpg" \
+            "$work_dir/nginx_signing.key" || return 1
+        mkdir -p /usr/share/keyrings /etc/apt/sources.list.d /etc/apt/preferences.d || return 1
+        install -m 644 "$work_dir/nginx-keyring.gpg" /usr/share/keyrings/nginx-archive-keyring.gpg || return 1
+        printf 'deb [arch=%s signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] %s %s nginx\n' \
+            "$arch" "$_NGINX_REPO_URL" "$codename" > "$work_dir/vless-nginx.list" || return 1
+        printf 'Package: nginx nginx-module-*\nPin: origin nginx.org\nPin-Priority: 900\n' \
+            > "$work_dir/vless-nginx.pref" || return 1
+        install -m 644 "$work_dir/vless-nginx.list" /etc/apt/sources.list.d/vless-nginx.list || return 1
+        install -m 644 "$work_dir/vless-nginx.pref" /etc/apt/preferences.d/vless-nginx || return 1
+        # apt update 默认可能仅告警并继续使用旧索引，Error-Mode=any 将其视为失败。
+        apt-get update -qq -o APT::Update::Error-Mode=any || return 1
+    else
+        rpm --import "$work_dir/nginx_signing.key" || return 1
+        mkdir -p /etc/yum.repos.d || return 1
+        cat > "$work_dir/vless-nginx.repo" << EOF
+[vless-nginx]
+name=Nginx official $channel
+baseurl=$_NGINX_REPO_URL/
+enabled=1
+gpgcheck=1
+gpgkey=https://nginx.org/keys/nginx_signing.key
+sslverify=1
+module_hotfixes=true
+metadata_expire=0
+EOF
+        install -m 644 "$work_dir/vless-nginx.repo" /etc/yum.repos.d/vless-nginx.repo || return 1
+        if check_cmd dnf; then
+            dnf --disablerepo='*' --enablerepo=vless-nginx makecache --refresh || return 1
+        else
+            yum --disablerepo='*' --enablerepo=vless-nginx --setopt=metadata_expire=0 makecache || return 1
+        fi
+    fi
+}
+
+_nginx_latest_package_version() {
+    local packages
+    case "$DISTRO" in
+        debian|ubuntu)
+            packages=$(LC_ALL=C apt-cache madison nginx) || return 1
+            awk -F'|' -v repo="$_NGINX_REPO_URL" 'index($3, repo) {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' <<< "$packages"
+            ;;
+        centos)
+            local pm="yum"
+            check_cmd dnf && pm="dnf"
+            packages=$(LC_ALL=C "$pm" --disablerepo='*' --enablerepo=vless-nginx --showduplicates list nginx) || return 1
+            awk '$1 ~ /^nginx\./ && $3 == "vless-nginx" {print $2}' <<< "$packages"
+            ;;
+        alpine)
+            packages=$(apk policy nginx) || return 1
+            awk -v repo="$_NGINX_REPO_URL" '
+                /^[ \t]+[0-9][^ \t]*:$/ {version=$1; sub(/:$/, "", version)}
+                index($0, repo) && version != "" {print version}
+            ' <<< "$packages"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+_nginx_installed_package_version() {
+    case "$DISTRO" in
+        debian|ubuntu)
+            dpkg-query -W -f='${db:Status-Status}\t${Version}\n' nginx | \
+                awk '$1 == "installed" {print $2; found=1} END {exit !found}' ;;
+        centos) rpm -q --qf '%{VERSION}-%{RELEASE}' nginx ;;
+        alpine) apk info --installed --verbose nginx | sed -n 's/^nginx-//p' ;;
+        *) return 1 ;;
+    esac
+}
+
+# 官方模块包会随 Nginx 的精确版本依赖一起更新；发行版/自编译模块不能跨 ABI
+# 直接复用。迁移前拒绝这类配置，避免包已替换后才发现模块损坏、服务无法启动。
+_check_nginx_upgrade_modules() {
+    local work_dir="$1" modules prefix module owner
+    nginx -T > "$work_dir/effective-config" 2> "$work_dir/config-test.log" || return 1
+    modules=$(awk '/^[[:space:]]*load_module[[:space:]]+/ {path=$2; gsub(/[";\047]/, "", path); print path}' \
+        "$work_dir/effective-config") || return 1
+    [[ -z "$modules" ]] && return 0
+    prefix=$(nginx -V 2>&1 | sed -n 's/.*--prefix=\([^ ]*\).*/\1/p') || return 1
+    while IFS= read -r module; do
+        if [[ "$module" != /* ]]; then
+            [[ -n "$prefix" ]] || return 1
+            module="${prefix%/}/$module"
+        fi
+        module=$(readlink -f "$module") || return 1
+        case "$DISTRO" in
+            debian|ubuntu)
+                owner=$(dpkg-query -S "$module" 2>/dev/null | awk -F': ' 'NR == 1 {print $1}') ;;
+            centos)
+                owner=$(rpm -qf --qf '%{NAME}' "$module" 2>/dev/null) ;;
+            alpine)
+                owner=$(apk info --who-owns "$module" 2>/dev/null | sed -n 's/^.* is owned by \(nginx-module-[^ ]*\)$/\1/p') ;;
+        esac
+        if [[ "$owner" != nginx-module-* ]]; then
+            _err "动态模块 $(basename "$module") 不属于官方模块包，需先准备匹配新版的模块，未执行升级"
+            return 1
+        fi
+    done <<< "$modules"
+    return 0
+}
+
+# 发行版拆分包迁移到官方包时可能替换 nginx.conf 或新增 default.conf。
+# 整目录恢复原配置（含权限、软链接），避免只用 --force-confold 仍丢失订阅入口。
+_restore_nginx_upgrade_config() {
+    local backup="$1" stage
+    stage=$(mktemp -d /etc/.vless-nginx-restore.XXXXXX) || return 1
+    if ! cp -a "$backup" "$stage/nginx"; then
+        rm -rf -- "$stage"
+        return 1
+    fi
+    if [[ -e /etc/nginx ]] && ! mv /etc/nginx "$stage/package-config"; then
+        rm -rf -- "$stage"
+        return 1
+    fi
+    if ! mv "$stage/nginx" /etc/nginx; then
+        [[ -e "$stage/package-config" ]] && mv "$stage/package-config" /etc/nginx
+        _err "恢复 Nginx 配置失败，临时文件保留在 $stage"
+        return 1
+    fi
+    rm -rf -- "$stage"
+}
+
+# 保留现有 Nginx/订阅配置，按官方源的实际候选版本升级并验证，不假报成功。
+upgrade_nginx_security() (
     if ! check_cmd nginx; then
         _warn "Nginx 未安装，跳过安全升级"
         return 0
     fi
-
+    local channel="${VLESS_NGINX_CHANNEL:-mainline}"
+    if [[ "$channel" != "mainline" && "$channel" != "stable" ]]; then
+        _err "VLESS_NGINX_CHANNEL 仅支持 mainline 或 stable"
+        return 1
+    fi
+    case "$DISTRO" in
+        debian|ubuntu|centos|alpine) ;;
+        *) _err "暂不支持当前系统的 Nginx 官方升级"; return 1 ;;
+    esac
+    if [[ ! -d /etc/nginx || -L /etc/nginx ]] || ! nginx -t; then
+        _err "现有 Nginx 配置检查失败或配置目录不是普通目录，未执行升级"
+        return 1
+    fi
     local was_running=false
     svc status nginx >/dev/null 2>&1 && was_running=true
-
-    local before after
-    before=$(nginx -v 2>&1 | awk -F/ '{print $2}')
-    _info "升级 Nginx 软件包到发行版仓库可用的安全版本 (保留现有配置)..."
-
+    local before after before_package after_package before_upstream target target_upstream candidates
+    before=$(nginx -v 2>&1 | sed -n 's#^nginx version: nginx/\([^ ]*\).*#\1#p') || { _err "读取 Nginx 版本失败"; return 1; }
+    before_package=$(_nginx_installed_package_version) || { _err "读取已安装 Nginx 软件包版本失败"; return 1; }
+    if [[ ! "$before" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || -z "$before_package" ]]; then
+        _err "无法确认当前 Nginx 及其软件包版本，未执行升级"
+        return 1
+    fi
+    before_upstream="${before_package#*:}"
+    before_upstream="${before_upstream%%[-~+]*}"
+    if [[ "$before" != "$before_upstream" ]]; then
+        _err "Nginx 命令与软件包版本不一致，请检查 PATH 或自编译安装，未执行升级"
+        return 1
+    fi
+    local work_dir keep_backup=false _NGINX_REPO_URL=""
+    work_dir=$(mktemp -d /tmp/vless-nginx-upgrade.XXXXXX) || return 1
+    trap '[[ "$keep_backup" == "true" ]] || rm -rf -- "$work_dir"' EXIT
+    if ! _check_nginx_upgrade_modules "$work_dir"; then
+        _err "Nginx 动态模块兼容性检查失败，未改动软件包与配置"
+        return 1
+    fi
+    _info "从 Nginx 官方 $channel 仓库获取最新版本 (保留现有配置/订阅)..."
+    if ! _setup_nginx_official_repo "$channel" "$work_dir"; then
+        _err "Nginx 官方源配置或索引刷新失败，未执行升级（请检查系统支持及网络）"
+        return 1
+    fi
+    candidates=$(_nginx_latest_package_version) || { _err "查询 Nginx 官方版本失败"; return 1; }
+    target=$(printf '%s\n' "$candidates" | sort -V | tail -n 1)
+    target_upstream="${target#*:}"
+    target_upstream="${target_upstream%%[-~+]*}"
+    if [[ ! "$target_upstream" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        _err "官方源未返回可用的 Nginx 版本，未执行升级"
+        return 1
+    fi
+    _info "当前 Nginx: $before ($before_package)，官方候选: $target"
+    if [[ "$before" != "$target_upstream" && "$(printf '%s\n' "$before" "$target_upstream" | sort -V | tail -n 1)" == "$before" ]]; then
+        _ok "当前 Nginx 版本高于所选官方源版本，保留 $before，不执行降级"
+        return 0
+    fi
+    if [[ "${before_package#*:}" == "${target#*:}" ]]; then
+        _ok "Nginx 已是官方 $channel 最新版本 ($before, $target)"
+        return 0
+    fi
+    if [[ "$DISTRO" == "debian" || "$DISTRO" == "ubuntu" ]] && \
+        dpkg --compare-versions "$before_package" gt "$target"; then
+        _ok "当前 Nginx 软件包高于所选官方源版本，未执行降级 ($before_package)"
+        return 0
+    fi
+    cp -a /etc/nginx "$work_dir/nginx-config" || { _err "备份 Nginx 配置失败，未执行升级"; return 1; }
+    keep_backup=true
+    # 迁移包会替换 init 脚本/PID 路径；先用旧服务定义停止旧 master，避免端口
+    # 仍被旧进程占用，或维护脚本在原配置恢复之前尝试热升级/启动默认站点。
+    if [[ "$was_running" == "true" ]] && ! svc stop nginx; then
+        _err "停止旧版 Nginx 失败，未升级软件包；配置备份: $work_dir/nginx-config"
+        return 1
+    fi
+    local package_ok=true
     case "$DISTRO" in
         alpine)
-            apk update >/dev/null 2>&1
-            apk upgrade --available nginx
+            apk add --upgrade nginx@vless_nginx || package_ok=false
             ;;
         centos)
-            if command -v dnf >/dev/null 2>&1; then
-                dnf upgrade -y nginx
+            if check_cmd dnf; then
+                dnf --enablerepo=vless-nginx --best install -y "nginx-${target#*:}" || package_ok=false
             else
-                yum update -y nginx
+                yum --enablerepo=vless-nginx install -y "nginx-${target#*:}" || package_ok=false
             fi
             ;;
         debian|ubuntu)
-            apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --only-upgrade \
-                -o Dpkg::Options::="--force-confold" nginx
-            ;;
-        *)
-            _err "暂不支持当前系统的 Nginx 自动安全升级"
-            return 1
+            DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y -qq \
+                -o Dpkg::Options::="--force-confold" -o Dpkg::Options::="--force-confdef" \
+                "nginx=$target" || package_ok=false
             ;;
     esac
-
-    after=$(nginx -v 2>&1 | awk -F/ '{print $2}')
-
-    if nginx -t >/dev/null 2>&1; then
-        if [[ "$was_running" == "true" ]]; then
-            svc reload nginx 2>/dev/null || svc restart nginx 2>/dev/null || true
-        else
-            svc stop nginx 2>/dev/null || true
-        fi
-    else
-        _warn "Nginx 配置检测未通过，已跳过 reload，请手动执行 nginx -t 检查"
+    if ! _restore_nginx_upgrade_config "$work_dir/nginx-config"; then
+        _err "Nginx 配置恢复失败，原配置备份: $work_dir/nginx-config"
+        return 1
     fi
-
-    _ok "Nginx 安全升级完成 (${before:-unknown} -> ${after:-unknown})"
+    if [[ "$was_running" != "true" ]]; then
+        svc stop nginx || { _err "无法恢复 Nginx 停止状态，配置备份: $work_dir/nginx-config"; return 1; }
+    fi
+    if [[ "$package_ok" != "true" ]]; then
+        if [[ "$was_running" == "true" ]] && nginx -t >/dev/null 2>&1; then
+            svc restart nginx || _err "恢复 Nginx 服务失败，请检查服务状态"
+        fi
+        _err "Nginx 软件包升级失败，已恢复配置，备份保留在 $work_dir/nginx-config"
+        return 1
+    fi
+    after=$(nginx -v 2>&1 | sed -n 's#^nginx version: nginx/\([^ ]*\).*#\1#p') || { _err "读取新版 Nginx 版本失败，配置备份: $work_dir/nginx-config"; return 1; }
+    after_package=$(_nginx_installed_package_version) || { _err "读取新版 Nginx 软件包版本失败，配置备份: $work_dir/nginx-config"; return 1; }
+    if [[ "$after" != "$target_upstream" || "${after_package#*:}" != "${target#*:}" ]]; then
+        _err "Nginx 未达到官方候选版本 ($target)，实际: ${after:-unknown} / ${after_package:-unknown}；配置备份: $work_dir/nginx-config"
+        return 1
+    fi
+    # apk 从发行版包升级时不执行官方包的 pre-install，默认缓存父目录可能缺失。
+    if [[ "$DISTRO" == "alpine" ]] && ! mkdir -p /var/cache/nginx; then
+        _err "创建 Nginx 运行目录失败，配置备份: $work_dir/nginx-config"
+        return 1
+    fi
+    if ! nginx -t; then
+        _err "新版 Nginx 与现有配置/模块不兼容，未重启；配置备份: $work_dir/nginx-config"
+        return 1
+    fi
+    # reload 不会换掉旧 master 的可执行文件，升级后必须 restart 才真正运行新版。
+    if [[ "$was_running" == "true" ]]; then
+        if ! svc restart nginx || ! svc status nginx >/dev/null 2>&1; then
+            _err "新版 Nginx 启动失败，配置备份: $work_dir/nginx-config"
+            return 1
+        fi
+    fi
+    keep_backup=false
+    _ok "Nginx 官方升级完成 ($before -> $after, 软件包 $after_package)"
     return 0
-}
+)
 
 EXTERNAL_LINKS_FILE="$CFG/external_links.txt"
 EXTERNAL_SUBS_FILE="$CFG/external_subs.txt"
@@ -16923,9 +17202,10 @@ _force_update_cores() {
 
 _upgrade_nginx_security_menu() {
     _header
-    echo -e "  ${W}Nginx 安全升级${NC}"
+    echo -e "  ${W}Nginx 官方最新版升级${NC}"
     _line
-    echo -e "  ${D}仅升级 nginx 软件包，保留现有 nginx 配置与订阅设置。${NC}"
+    echo -e "  ${D}从官方 ${VLESS_NGINX_CHANNEL:-mainline} 源获取最新版，保留 nginx 配置与订阅设置。${NC}"
+    echo -e "  ${D}升级时短暂停止并重启运行中的 Nginx，使新版生效；已停止的服务保持停止。${NC}"
     _line
     read -rp "  确认执行? [y/N]: " confirm
     [[ "$confirm" =~ ^[yY]$ ]] || return 0
@@ -17006,7 +17286,7 @@ update_manage_menu() {
         _item "2" "协议组件立即更新 (Xray/Sing-box/Snell/AnyTLS/ShadowTLS/NaïveProxy)"
         _item "3" "配置启动自动更新 Xray/Sing-box $current_auto"
         _item "4" "强制续期 ACME 证书"
-        _item "5" "Nginx 安全升级 (不改配置/订阅)"
+        _item "5" "Nginx 官方最新版升级 (保留配置/订阅)"
         _item "0" "返回上级菜单"
         _line
         
